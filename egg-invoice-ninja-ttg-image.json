@@ -1,0 +1,201 @@
+{
+  "meta": {
+    "version": "PTDL_v2"
+  },
+  "exported_at": "2026-01-30T12:00:00-05:00",
+  "name": "Invoice Ninja v5 (TTG Octane)",
+  "author": "stuff@ttgonline.ca",
+  "description": "Invoice Ninja v5 (Octane/FrankenPHP) TTG image that keeps all writable data in /home/container (portable across nodes). Start Redis first. Use LARAVEL_ROLE=app for web, worker for queues.",
+  "features": [],
+  "docker_images": {
+    "Invoice Ninja (TTG) - latest": "ghcr.io/ttgonlineca/invoiceninja-ptero:latest"
+  },
+  "file_denylist": [],
+  "startup": "/bin/sh -lc 'exec /usr/local/bin/ttg-entrypoint.sh'",
+  "config": {
+    "files": "{}",
+    "startup": "{}",
+    "logs": "{}",
+    "stop": "SIGTERM"
+  },
+  "scripts": {
+    "installation": {
+      "script": "#!/bin/sh\nexit 0\n",
+      "container": "alpine:3.19",
+      "entrypoint": "sh"
+    }
+  },
+  "variables": [
+    {
+      "name": "Laravel Role",
+      "description": "app=web UI, worker=background jobs, scheduler=cron loop",
+      "env_variable": "LARAVEL_ROLE",
+      "default_value": "app",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:app,worker,scheduler"
+    },
+    {
+      "name": "APP_ENV",
+      "description": "production",
+      "env_variable": "APP_ENV",
+      "default_value": "production",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:32"
+    },
+    {
+      "name": "APP_DEBUG",
+      "description": "false",
+      "env_variable": "APP_DEBUG",
+      "default_value": "false",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:true,false,0,1"
+    },
+    {
+      "name": "APP_URL",
+      "description": "Public URL (ex: https://billing.ttgonline.ca)",
+      "env_variable": "APP_URL",
+      "default_value": "https://billing.ttgonline.ca",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "APP_KEY",
+      "description": "Laravel APP_KEY from your existing install",
+      "env_variable": "APP_KEY",
+      "default_value": "base64:REPLACE_ME",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "REQUIRE_HTTPS",
+      "description": "Keep false when using a reverse proxy/TLS termination",
+      "env_variable": "REQUIRE_HTTPS",
+      "default_value": "false",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:true,false,0,1"
+    },
+    {
+      "name": "DB_TYPE",
+      "description": "mysql for MariaDB/MySQL",
+      "env_variable": "DB_TYPE",
+      "default_value": "mysql",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:mysql,pgsql"
+    },
+    {
+      "name": "DB_HOST",
+      "description": "DB host/IP",
+      "env_variable": "DB_HOST",
+      "default_value": "192.168.0.108",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "DB_PORT",
+      "description": "DB port",
+      "env_variable": "DB_PORT",
+      "default_value": "3307",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer"
+    },
+    {
+      "name": "DB_DATABASE",
+      "description": "DB name",
+      "env_variable": "DB_DATABASE",
+      "default_value": "ninjadb",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "DB_USERNAME",
+      "description": "DB user",
+      "env_variable": "DB_USERNAME",
+      "default_value": "ninja",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "DB_PASSWORD",
+      "description": "DB password",
+      "env_variable": "DB_PASSWORD",
+      "default_value": "REPLACE_ME",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "REDIS_HOST",
+      "description": "Redis host/IP",
+      "env_variable": "REDIS_HOST",
+      "default_value": "127.0.0.1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "REDIS_PORT",
+      "description": "Redis port (default 6379)",
+      "env_variable": "REDIS_PORT",
+      "default_value": "6379",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer"
+    },
+    {
+      "name": "REDIS_PASSWORD",
+      "description": "Redis password (must match Redis requirepass). Leave blank if none.",
+      "env_variable": "REDIS_PASSWORD",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string"
+    },
+    {
+      "name": "QUEUE_CONNECTION",
+      "description": "redis",
+      "env_variable": "QUEUE_CONNECTION",
+      "default_value": "redis",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "SESSION_DRIVER",
+      "description": "redis",
+      "env_variable": "SESSION_DRIVER",
+      "default_value": "redis",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "CACHE_DRIVER",
+      "description": "redis",
+      "env_variable": "CACHE_DRIVER",
+      "default_value": "redis",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "MAIL_MAILER",
+      "description": "smtp or log",
+      "env_variable": "MAIL_MAILER",
+      "default_value": "smtp",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    }
+  ]
+}
