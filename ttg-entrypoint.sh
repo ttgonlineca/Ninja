@@ -6,7 +6,7 @@ echo "[TTG] Invoice Ninja (Octane) starting..."
 ROLE="${LARAVEL_ROLE:-app}"
 
 # Read-only app baked into the image
-IMAGE_APP_DIR="${IMAGE_APP_DIR:-/var/www/html}"
+IMAGE_APP_DIR="${IMAGE_APP_DIR:-/app}"
 
 # Pterodactyl writable persistent dir
 PERSIST_DIR="${PERSIST_DIR:-/home/container}"
