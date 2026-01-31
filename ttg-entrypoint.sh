@@ -19,13 +19,25 @@ echo "[TTG] Persistent storage=${STORAGE_DIR}"
 # Ensure persistent storage exists
 mkdir -p "${STORAGE_DIR}"
 
-# Wire Laravel storage to persistent volume
-if [ -e "${APP_DIR}/storage" ] && [ ! -L "${APP_DIR}/storage" ]; then
-  rm -rf "${APP_DIR}/storage"
-fi
-ln -sfn "${STORAGE_DIR}" "${APP_DIR}/storage"
+# Wire Laravel storage to persistent volume WITHOUT trying to delete read-only image files.
+# /app is read-only in this environment, so removing /app/storage will fail.
+# We only replace it if it's already a symlink; otherwise we just create/force the symlink path.
+if [ -L "${APP_DIR}/storage" ]; then
+  ln -sfn "${STORAGE_DIR}" "${APP_DIR}/storage"
+else
+  # If it's a real directory (from the image), we cannot remove it. Try to move it aside; ignore failure.
+  if [ -e "${APP_DIR}/storage" ]; then
+    echo "[TTG] Detected image storage dir at ${APP_DIR}/storage (read-only likely)."
+    echo "[TTG] Attempting to move aside -> ${APP_DIR}/storage.image (safe if writable, ignored if not)..."
+    mv "${APP_DIR}/storage" "${APP_DIR}/storage.image" 2>/dev/null || true
+  fi
 
-# Ensure required dirs
+  # Create/force symlink. If storage couldn't be moved due to read-only, symlink will fail.
+  # In that case we continue, but Laravel will use image storage and may not persist. Better than crashing.
+  ln -sfn "${STORAGE_DIR}" "${APP_DIR}/storage" 2>/dev/null || true
+fi
+
+# Ensure required storage subdirs exist on persistent volume
 mkdir -p "${STORAGE_DIR}/app" "${STORAGE_DIR}/framework" "${STORAGE_DIR}/logs"
 chmod -R 775 "${STORAGE_DIR}" || true
 
@@ -37,7 +49,7 @@ if [ ! -f .env ] && [ -f .env.example ]; then
   cp .env.example .env
 fi
 
-# Sync env vars safely
+# Sync env vars safely (only if .env exists)
 if [ -f .env ] && [ "${APP_URL:-}" != "" ]; then
   grep -q '^APP_URL=' .env \
     && sed -i "s|^APP_URL=.*|APP_URL=${APP_URL}|g" .env \
