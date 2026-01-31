@@ -2,15 +2,12 @@ FROM invoiceninja/invoiceninja-octane:latest
 
 USER root
 
-# Store a read-only golden copy of the app
+# Keep a read-only golden copy for first-run hydration
 RUN mkdir -p /opt/invoiceninja-ro \
  && cp -a /app/. /opt/invoiceninja-ro/
 
-# Ensure /app exists for PHP preload (base image expects /app/preload.php)
-# Keep it minimal: just preload.php copied from the golden source
-RUN rm -rf /app \
- && mkdir -p /app \
- && cp -a /opt/invoiceninja-ro/preload.php /app/preload.php
+# Disable PHP preload (it expects /app/preload.php before entrypoint runs)
+RUN printf "opcache.preload=\nopcache.preload_user=\n" > /usr/local/etc/php/conf.d/zz-disable-preload.ini
 
 COPY ttg-entrypoint.sh /usr/local/bin/ttg-entrypoint.sh
 RUN chmod +x /usr/local/bin/ttg-entrypoint.sh
