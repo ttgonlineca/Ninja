@@ -13,6 +13,12 @@ echo "[TTG] Role: ${ROLE}"
 echo "[TTG] APP_DIR=${APP_DIR}"
 echo "[TTG] SRC_DIR=${SRC_DIR}"
 
+# Make sure preload file exists where PHP expects it
+mkdir -p /app
+if [ ! -f /app/preload.php ] && [ -f "${SRC_DIR}/preload.php" ]; then
+  cp -a "${SRC_DIR}/preload.php" /app/preload.php || true
+fi
+
 # First boot: hydrate app into persistent storage
 if [ ! -f "${APP_DIR}/artisan" ]; then
   echo "[TTG] First run: copying app -> ${APP_DIR}"
