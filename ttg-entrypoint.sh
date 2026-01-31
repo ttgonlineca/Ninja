@@ -5,81 +5,57 @@ echo "[TTG] Invoice Ninja (Octane) starting..."
 
 ROLE="${LARAVEL_ROLE:-app}"
 
-APP_DIR="/app"
-
 PERSIST_DIR="/home/container"
-ENV_FILE="${PERSIST_DIR}/.env"
-STORAGE_DIR="${PERSIST_DIR}/storage"
+APP_DIR="${PERSIST_DIR}/app"
+SRC_DIR="/opt/invoiceninja-ro"
 
 echo "[TTG] Role: ${ROLE}"
 echo "[TTG] APP_DIR=${APP_DIR}"
-echo "[TTG] Env file=${ENV_FILE}"
-echo "[TTG] Persistent storage=${STORAGE_DIR}"
+echo "[TTG] SRC_DIR=${SRC_DIR}"
 
-# Ensure persistent dirs exist
-mkdir -p "${PERSIST_DIR}" \
-  "${STORAGE_DIR}/app" \
-  "${STORAGE_DIR}/framework/cache" \
-  "${STORAGE_DIR}/framework/sessions" \
-  "${STORAGE_DIR}/framework/views" \
-  "${STORAGE_DIR}/logs"
-
-chmod -R 775 "${STORAGE_DIR}" || true
+# First boot: hydrate app into persistent storage
+if [ ! -f "${APP_DIR}/artisan" ]; then
+  echo "[TTG] First run: copying app -> ${APP_DIR}"
+  mkdir -p "${APP_DIR}"
+  cp -a "${SRC_DIR}/." "${APP_DIR}/"
+fi
 
 cd "${APP_DIR}"
 
-# Create persistent .env on first run
-if [ ! -f "${ENV_FILE}" ] && [ -f .env.example ]; then
-  echo "[TTG] Creating persistent .env from /app/.env.example -> ${ENV_FILE}"
-  cp .env.example "${ENV_FILE}"
+# Ensure writable dirs Laravel/IN needs
+mkdir -p storage bootstrap/cache
+mkdir -p storage/app storage/framework/cache storage/framework/sessions storage/framework/views storage/logs
+chmod -R 775 storage bootstrap/cache || true
+
+# Create .env on first run (inside persistent app dir)
+if [ ! -f .env ] && [ -f .env.example ]; then
+  echo "[TTG] Creating .env from .env.example"
+  cp .env.example .env
 fi
 
-# Load persistent env early (so we can override logging + paths)
-if [ -f "${ENV_FILE}" ]; then
-  set -a
-  . "${ENV_FILE}"
-  set +a
-else
-  echo "[TTG] WARNING: ${ENV_FILE} not found; continuing with runtime env only."
+# Optional: apply runtime vars into .env (safe)
+if [ -f .env ] && [ "${APP_URL:-}" != "" ]; then
+  grep -q '^APP_URL=' .env \
+    && sed -i "s|^APP_URL=.*|APP_URL=${APP_URL}|g" .env \
+    || echo "APP_URL=${APP_URL}" >> .env
 fi
 
-# Force log + pid paths away from /app/storage (read-only in Pterodactyl)
-# This avoids crashing even if /app/storage can't be redirected.
-export LOG_CHANNEL="${LOG_CHANNEL:-stderr}"
-export LOG_STACK="${LOG_STACK:-stderr}"
-export LOG_LEVEL="${LOG_LEVEL:-debug}"
-export OCTANE_SERVER="${OCTANE_SERVER:-frankenphp}"
-export OCTANE_HTTPS="${OCTANE_HTTPS:-false}"
-
-# Some apps write PID files under storage; keep them in /home/container
-export OCTANE_PID_PATH="${OCTANE_PID_PATH:-${STORAGE_DIR}/octane.pid}"
-export OCTANE_STATE_FILE="${OCTANE_STATE_FILE:-${STORAGE_DIR}/octane.state}"
-
-# Also ensure Laravel uses a writable cache path where possible
-export CACHE_DRIVER="${CACHE_DRIVER:-file}"
-export SESSION_DRIVER="${SESSION_DRIVER:-file}"
-
-# Apply APP_URL / APP_KEY into persistent .env if provided as runtime env
-if [ -f "${ENV_FILE}" ] && [ "${APP_URL:-}" != "" ]; then
-  grep -q '^APP_URL=' "${ENV_FILE}" \
-    && sed -i "s|^APP_URL=.*|APP_URL=${APP_URL}|g" "${ENV_FILE}" \
-    || echo "APP_URL=${APP_URL}" >> "${ENV_FILE}"
-fi
-if [ -f "${ENV_FILE}" ] && [ "${APP_KEY:-}" != "" ]; then
-  grep -q '^APP_KEY=' "${ENV_FILE}" \
-    && sed -i "s|^APP_KEY=.*|APP_KEY=${APP_KEY}|g" "${ENV_FILE}" \
-    || echo "APP_KEY=${APP_KEY}" >> "${ENV_FILE}"
+if [ -f .env ] && [ "${APP_KEY:-}" != "" ]; then
+  grep -q '^APP_KEY=' .env \
+    && sed -i "s|^APP_KEY=.*|APP_KEY=${APP_KEY}|g" .env \
+    || echo "APP_KEY=${APP_KEY}" >> .env
 fi
 
-# Sanity check
+# Sanity
 if [ ! -f artisan ]; then
-  echo "[TTG] FATAL: artisan not found in ${APP_DIR}"
+  echo "[TTG] FATAL: artisan missing in ${APP_DIR}"
+  ls -la "${APP_DIR}" | head -n 50 || true
   exit 1
 fi
 
 case "${ROLE}" in
   app)
-    echo "[TTG] Starting Octane (FrankenPHP) with env from ${ENV_FILE}..."
+    echo "[TTG] Starting Octane (FrankenPHP)..."
     exec php artisan octane:start \
       --server=frankenphp \
       --host=0.0.0.0 \
