@@ -13,12 +13,6 @@ echo "[TTG] Role: ${ROLE}"
 echo "[TTG] APP_DIR=${APP_DIR}"
 echo "[TTG] SRC_DIR=${SRC_DIR}"
 
-# Make sure preload file exists where PHP expects it
-mkdir -p /app
-if [ ! -f /app/preload.php ] && [ -f "${SRC_DIR}/preload.php" ]; then
-  cp -a "${SRC_DIR}/preload.php" /app/preload.php || true
-fi
-
 # First boot: hydrate app into persistent storage
 if [ ! -f "${APP_DIR}/artisan" ]; then
   echo "[TTG] First run: copying app -> ${APP_DIR}"
@@ -61,9 +55,16 @@ fi
 
 case "${ROLE}" in
   app)
-    echo "[TTG] Starting Octane (FrankenPHP)..."
+    echo "[TTG] Starting Octane (RoadRunner)..."
+
+    if ! command -v rr >/dev/null 2>&1; then
+      echo "[TTG] FATAL: RoadRunner binary (rr) not found in image."
+      echo "[TTG] Fix: add rr to the image or switch to a non-Octane start method."
+      exit 127
+    fi
+
     exec php artisan octane:start \
-      --server=frankenphp \
+      --server=roadrunner \
       --host=0.0.0.0 \
       --port="${PORT:-8000}"
     ;;
