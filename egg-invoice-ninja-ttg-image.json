@@ -55,7 +55,7 @@
     },
     {
       "name": "APP_URL",
-      "description": "Public URL (ex: https://billing.ttgonline.ca)",
+      "description": "Public URL (ex: https://website.com)",
       "env_variable": "APP_URL",
       "default_value": "https://billing.ttgonline.ca",
       "user_viewable": true,
@@ -93,7 +93,7 @@
       "name": "DB_HOST",
       "description": "DB host/IP",
       "env_variable": "DB_HOST",
-      "default_value": "192.168.0.108",
+      "default_value": "0.0.0.0",
       "user_viewable": true,
       "user_editable": true,
       "rules": "required|string"
