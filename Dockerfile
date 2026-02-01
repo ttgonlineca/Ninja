@@ -31,8 +31,9 @@ RUN set -eux; \
 # Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
-# Nginx template + supervisor config (repo root)
-COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+# Templates + supervisor config (repo root)
+RUN mkdir -p /etc/nginx/templates
+COPY nginx.conf.template /etc/nginx/templates/nginx.conf.template
 COPY supervisord.conf /etc/supervisor/supervisord.conf
 
 # Entrypoint
