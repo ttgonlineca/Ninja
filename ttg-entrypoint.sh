@@ -19,19 +19,25 @@ if [ ! -f "$APP_DIR/artisan" ]; then
   exit 1
 fi
 
-# Writable dirs for configs + nginx temps
 mkdir -p /home/container/nginx
 mkdir -p /tmp/nginx/client_body /tmp/nginx/proxy /tmp/nginx/fastcgi /tmp/nginx/uwsgi /tmp/nginx/scgi
 
-# Render nginx.conf into writable path
-envsubst '${PORT}' \
-  < /etc/nginx/templates/nginx.conf.template \
-  > /home/container/nginx/nginx.conf
+# Export PORT so envsubst definitely sees it
+export PORT
+
+# Substitute ALL vars (simple + reliable)
+envsubst < /etc/nginx/templates/nginx.conf.template > /home/container/nginx/nginx.conf
+
+# Hard check so we don’t launch nginx with a broken config
+if ! grep -qE 'listen[[:space:]]+[0-9]+' /home/container/nginx/nginx.conf; then
+  echo "[TTG] FATAL: nginx.conf render failed (listen directive missing/invalid)"
+  echo "[TTG] Dumping rendered listen lines:"
+  grep -n 'listen' /home/container/nginx/nginx.conf || true
+  exit 1
+fi
 
 echo "[TTG] Rendered nginx config: /home/container/nginx/nginx.conf"
 
-# Don’t chown in Pterodactyl — it will fail under non-root UID.
-# If anything, ensure readable permissions (best-effort).
 chmod -R a+rX /home/container/nginx /home/container/public /home/container/storage 2>/dev/null || true
 
 echo "[TTG] Starting Supervisor"
