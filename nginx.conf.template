@@ -26,7 +26,8 @@ http {
         listen __PORT__;
         server_name _;
 
-        root /home/container/public;
+        # Invoice Ninja public dir is inside the app folder
+        root /home/container/app/public;
         index index.php index.html;
 
         location / {
