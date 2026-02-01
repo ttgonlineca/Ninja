@@ -2,7 +2,7 @@ FROM php:8.3-fpm-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System dependencies
+# System deps + PHP extensions
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -37,16 +37,16 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 ENV APP_DIR=/home/container/app
 ENV SRC_DIR=/opt/invoiceninja-ro
 
-RUN mkdir -p ${APP_DIR} ${SRC_DIR}
+RUN mkdir -p "${APP_DIR}" "${SRC_DIR}"
 
 # Copy Invoice Ninja source (read-only)
-COPY invoiceninja/ ${SRC_DIR}/
+COPY invoiceninja/ "${SRC_DIR}/"
 
-# Nginx config template
-COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
+# Nginx template (repo file is at root)
+COPY nginx.conf.template /etc/nginx/templates/default.conf.template
 
-# Supervisor config
-COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+# Supervisor config (repo file is at root)
+COPY supervisord.conf /etc/supervisor/supervisord.conf
 
 # Entrypoint
 COPY ttg-entrypoint.sh /usr/local/bin/ttg-entrypoint.sh
