@@ -1,33 +1,52 @@
-server {
-    listen ${PORT};
-    server_name _;
+worker_processes  1;
 
-    root /home/container/app/public;
-    index index.php index.html;
+error_log  /dev/stderr info;
+pid        /tmp/nginx.pid;
 
-    client_max_body_size 128M;
+events {
+    worker_connections  1024;
+}
 
-    # Basic hardening
-    add_header X-Content-Type-Options nosniff;
-    add_header X-Frame-Options SAMEORIGIN;
-    add_header X-XSS-Protection "1; mode=block";
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
 
-    location / {
-        try_files $uri $uri/ /index.php?$query_string;
-    }
+    access_log /dev/stdout;
 
-    location ~ \.php$ {
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_param PATH_INFO $fastcgi_path_info;
-        fastcgi_index index.php;
-        fastcgi_pass 127.0.0.1:9000;
-        fastcgi_read_timeout 300;
-    }
+    sendfile        on;
+    keepalive_timeout  65;
 
-    location ~* \.(?:ico|css|js|gif|jpe?g|png|svg|woff2?)$ {
-        expires 7d;
-        access_log off;
-        add_header Cache-Control "public";
+    # All temp paths must be writable when rootfs is read-only
+    client_body_temp_path /tmp/nginx/client_body;
+    proxy_temp_path       /tmp/nginx/proxy;
+    fastcgi_temp_path     /tmp/nginx/fastcgi;
+    uwsgi_temp_path       /tmp/nginx/uwsgi;
+    scgi_temp_path        /tmp/nginx/scgi;
+
+    server {
+        listen ${PORT};
+        server_name _;
+
+        root /home/container/public;
+        index index.php index.html;
+
+        # Invoice Ninja typical front controller
+        location / {
+            try_files $uri $uri/ /index.php?$query_string;
+        }
+
+        location ~ \.php$ {
+            include fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_param PATH_INFO $fastcgi_path_info;
+            fastcgi_pass 127.0.0.1:9000;
+            fastcgi_read_timeout 300;
+        }
+
+        location ~* \.(?:css|js|jpg|jpeg|gif|png|svg|ico|woff2?)$ {
+            expires 7d;
+            add_header Cache-Control "public, max-age=604800";
+            try_files $uri =404;
+        }
     }
 }
