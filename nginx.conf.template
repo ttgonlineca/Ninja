@@ -23,7 +23,7 @@ http {
     scgi_temp_path        /tmp/nginx/scgi;
 
     server {
-        listen ${PORT};
+        listen __PORT__;
         server_name _;
 
         root /home/container/public;
