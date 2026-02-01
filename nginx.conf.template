@@ -16,7 +16,6 @@ http {
     sendfile        on;
     keepalive_timeout  65;
 
-    # All temp paths must be writable when rootfs is read-only
     client_body_temp_path /tmp/nginx/client_body;
     proxy_temp_path       /tmp/nginx/proxy;
     fastcgi_temp_path     /tmp/nginx/fastcgi;
@@ -36,10 +35,18 @@ http {
 
         location ~ \.php$ {
             include /etc/nginx/fastcgi_params;
-            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-            fastcgi_param PATH_INFO $fastcgi_path_info;
             fastcgi_pass 127.0.0.1:9000;
+
+            fastcgi_index index.php;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+
             fastcgi_read_timeout 300;
+        }
+
+        location ~* \.(?:css|js|jpg|jpeg|gif|png|svg|ico|woff2?)$ {
+            expires 7d;
+            add_header Cache-Control "public, max-age=604800";
+            try_files $uri =404;
         }
     }
 }
