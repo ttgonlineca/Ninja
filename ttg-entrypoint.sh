@@ -3,7 +3,10 @@ set -e
 
 echo "[TTG] Invoice Ninja (FPM) starting..."
 
-PORT="${PORT:-8000}"
+# Pterodactyl provides SERVER_PORT (the allocation port).
+# Fallbacks: PORT (if you set it) then 8000.
+PORT="${SERVER_PORT:-${PORT:-8000}}"
+
 APP_DIR="/home/container/app"
 
 echo "[TTG] APP_DIR: $APP_DIR"
