@@ -12,6 +12,8 @@ on:
     paths:
       - "Dockerfile"
       - "ttg-entrypoint.sh"
+      - "nginx.conf.template"
+      - "supervisord.conf"
       - ".github/workflows/build.yml"
 
 permissions:
