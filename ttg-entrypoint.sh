@@ -9,13 +9,11 @@ APP_DIR="/home/container/app"
 echo "[TTG] APP_DIR: $APP_DIR"
 echo "[TTG] PORT: $PORT"
 
-# Hard dependency checks
 command -v envsubst >/dev/null 2>&1 || {
   echo "[TTG] FATAL: envsubst missing (install gettext-base in image)"
   exit 127
 }
 
-# App sanity
 if [ ! -f "$APP_DIR/artisan" ]; then
   echo "[TTG] FATAL: Invoice Ninja app not found in $APP_DIR"
   exit 1
@@ -32,8 +30,9 @@ envsubst '${PORT}' \
 
 echo "[TTG] Rendered nginx config: /home/container/nginx/nginx.conf"
 
-# Permissions (best-effort)
-chown -R www-data:www-data /home/container || true
+# Don’t chown in Pterodactyl — it will fail under non-root UID.
+# If anything, ensure readable permissions (best-effort).
+chmod -R a+rX /home/container/nginx /home/container/public /home/container/storage 2>/dev/null || true
 
 echo "[TTG] Starting Supervisor"
 exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
