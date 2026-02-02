@@ -1,11 +1,11 @@
 # TTG - Invoice Ninja Pterodactyl image (nginx + php-fpm + supervisor)
-# Goal: run as non-root, persist everything under /home/container
+# Everything persistent lives under /home/container
 
 FROM php:8.3-fpm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# --- OS packages + nginx + supervisor + build deps for PHP extensions ---
+# --- OS packages + nginx + supervisor + deps for PHP extensions (including GD) ---
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -20,7 +20,7 @@ RUN set -eux; \
       procps \
       tzdata \
       \
-      # php ext deps
+      # PHP extension build deps
       libzip-dev \
       libicu-dev \
       libpng-dev \
@@ -44,32 +44,23 @@ RUN set -eux; \
       pdo_mysql \
       zip \
     ; \
-    # HARD FAIL if gd didn't load (prevents "it built but not really" pain)
     php -m | grep -qi '^gd$' || (php -m; echo 'ERROR: PHP gd extension missing' >&2; exit 1)
 
-# Optional: if you want native php redis extension later, uncomment
-# RUN pecl install redis && docker-php-ext-enable redis
-
-# --- create Pterodactyl-ish user (UID/GID match what you’ve been using: 999/987) ---
+# --- Create the container user (matches your Ptero UID/GID pattern) ---
 RUN set -eux; \
     groupadd -g 987 pterodactyl || true; \
     useradd -m -u 999 -g 987 -d /home/container -s /bin/bash container || true; \
     mkdir -p /home/container; \
     chown -R 999:987 /home/container
 
-# --- app source baked read-only into image ---
+# --- Bake app source into the image read-only ---
 WORKDIR /opt/invoiceninja-ro
-
-# IMPORTANT:
-# Your repo must contain the Invoice Ninja app code inside ./invoiceninja/
-# (If yours is in a different folder, change the COPY line.)
 COPY ./invoiceninja/ /opt/invoiceninja-ro/
 
-# supervisor + templates + entrypoint from your repo
+# --- Config + entrypoint ---
 COPY ./supervisord.conf /etc/supervisor/supervisord.conf
 COPY ./nginx.conf.template /opt/ttg/nginx.conf.template
 COPY ./ttg-entrypoint.sh /usr/local/bin/ttg-entrypoint.sh
-
 RUN chmod +x /usr/local/bin/ttg-entrypoint.sh
 
 EXPOSE 8800
