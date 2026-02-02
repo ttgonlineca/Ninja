@@ -1,67 +1,69 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 echo "[TTG] Invoice Ninja (FPM) starting..."
+echo "[TTG] APP_DIR: /home/container/app"
 
-PORT="${SERVER_PORT:-${PORT:-8000}}"
 APP_DIR="/home/container/app"
-ENV_FILE="${APP_DIR}/.env"
+SRC_DIR="/opt/invoiceninja-ro"
 
-echo "[TTG] APP_DIR: $APP_DIR"
-echo "[TTG] PORT: $PORT"
+# Pterodactyl usually injects SERVER_PORT; fall back to PORT; then default
+PORT="${SERVER_PORT:-${PORT:-8800}}"
+echo "[TTG] PORT: ${PORT}"
 
-if [ ! -f "$APP_DIR/artisan" ]; then
-  echo "[TTG] FATAL: Invoice Ninja app not found in $APP_DIR"
-  exit 1
-fi
-
-# Ensure writable dirs
 mkdir -p /home/container/nginx
-mkdir -p /tmp/nginx/client_body /tmp/nginx/proxy /tmp/nginx/fastcgi /tmp/nginx/uwsgi /tmp/nginx/scgi
 
-# Ensure .env exists (Invoice Ninja should ship one, but be defensive)
-if [ ! -f "$ENV_FILE" ]; then
+# Copy app on first run
+if [ ! -f "${APP_DIR}/artisan" ]; then
+  echo "[TTG] First run: copying app into ${APP_DIR}"
+  mkdir -p "${APP_DIR}"
+  cp -a "${SRC_DIR}/." "${APP_DIR}/"
+fi
+
+# Ensure required writable dirs
+mkdir -p "${APP_DIR}/storage" "${APP_DIR}/bootstrap/cache"
+chmod -R 777 "${APP_DIR}/storage" "${APP_DIR}/bootstrap/cache" || true
+
+# Ensure .env exists
+if [ ! -f "${APP_DIR}/.env" ]; then
   if [ -f "${APP_DIR}/.env.example" ]; then
-    cp "${APP_DIR}/.env.example" "$ENV_FILE"
-    echo "[TTG] Created .env from .env.example"
+    cp "${APP_DIR}/.env.example" "${APP_DIR}/.env"
   else
-    touch "$ENV_FILE"
-    echo "[TTG] Created empty .env"
+    touch "${APP_DIR}/.env"
   fi
 fi
 
-# If APP_KEY variable exists in Pterodactyl, ensure it's set in .env (only if missing/blank)
+# If Ptero provides APP_KEY, enforce it into .env
 if [ -n "${APP_KEY:-}" ]; then
-  if ! grep -q '^APP_KEY=' "$ENV_FILE"; then
-    echo "APP_KEY=${APP_KEY}" >> "$ENV_FILE"
-    echo "[TTG] Wrote APP_KEY into .env"
+  if grep -q '^APP_KEY=' "${APP_DIR}/.env"; then
+    sed -i "s|^APP_KEY=.*|APP_KEY=${APP_KEY}|" "${APP_DIR}/.env"
   else
-    # Replace blank key only
-    if grep -q '^APP_KEY=$' "$ENV_FILE"; then
-      sed -i "s|^APP_KEY=$|APP_KEY=${APP_KEY}|" "$ENV_FILE"
-      echo "[TTG] Filled blank APP_KEY in .env"
-    else
-      echo "[TTG] APP_KEY already present in .env (not changing)"
-    fi
+    echo "APP_KEY=${APP_KEY}" >> "${APP_DIR}/.env"
   fi
-else
-  echo "[TTG] WARN: APP_KEY env var not set in Pterodactyl"
 fi
 
-# Non-root safe perms (Laravel needs these writable)
-chmod -R a+rwX "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" 2>/dev/null || true
+# IMPORTANT: Pterodactyl runtime env should win
+# (prevents old .env values overriding panel variables)
+export DB_HOST="${DB_HOST:-}"
+export DB_PORT="${DB_PORT:-}"
+export DB_DATABASE="${DB_DATABASE:-}"
+export DB_USERNAME="${DB_USERNAME:-}"
+export DB_PASSWORD="${DB_PASSWORD:-}"
+export REDIS_HOST="${REDIS_HOST:-}"
+export REDIS_PORT="${REDIS_PORT:-}"
+export CACHE_DRIVER="${CACHE_DRIVER:-}"
+export SESSION_DRIVER="${SESSION_DRIVER:-}"
+export QUEUE_CONNECTION="${QUEUE_CONNECTION:-}"
 
-# Clear cached config (so .env changes are used)
-cd "$APP_DIR"
-php artisan config:clear >/dev/null 2>&1 || true
-php artisan cache:clear  >/dev/null 2>&1 || true
-
-# Render nginx config (PORT only) without touching nginx $vars
-sed "s/__PORT__/${PORT}/g" \
-  /etc/nginx/templates/nginx.conf.template \
-  > /home/container/nginx/nginx.conf
-
+# Render nginx config
+env PORT="${PORT}" envsubst < /opt/ttg/nginx.conf.template > /home/container/nginx/nginx.conf
 echo "[TTG] Rendered nginx config: /home/container/nginx/nginx.conf"
+
+# Point nginx to our rendered config
+# Use -c to load our config directly, avoid writing into /etc (read-only in Ptero sometimes)
+export NGINX_CONF="/home/container/nginx/nginx.conf"
+sed -i 's|command=/usr/sbin/nginx -g "daemon off;"|command=/usr/sbin/nginx -c /home/container/nginx/nginx.conf -g "daemon off;"|' \
+  /etc/supervisor/supervisord.conf || true
 
 echo "[TTG] Starting Supervisor"
 exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
