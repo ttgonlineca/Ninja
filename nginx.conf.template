@@ -1,32 +1,18 @@
 worker_processes  1;
 
-error_log  /dev/stderr info;
-pid        /tmp/nginx.pid;
-
-events {
-    worker_connections  1024;
-}
+events { worker_connections  1024; }
 
 http {
     include       /etc/nginx/mime.types;
     default_type  application/octet-stream;
 
-    access_log /dev/stdout;
-
     sendfile        on;
     keepalive_timeout  65;
 
-    client_body_temp_path /tmp/nginx/client_body;
-    proxy_temp_path       /tmp/nginx/proxy;
-    fastcgi_temp_path     /tmp/nginx/fastcgi;
-    uwsgi_temp_path       /tmp/nginx/uwsgi;
-    scgi_temp_path        /tmp/nginx/scgi;
-
     server {
-        listen __PORT__;
+        listen {{PORT}};
         server_name _;
 
-        # Invoice Ninja public dir is inside the app folder
         root /home/container/app/public;
         index index.php index.html;
 
@@ -35,15 +21,14 @@ http {
         }
 
         location ~ \.php$ {
-            include /etc/nginx/fastcgi.conf;
+            include /etc/nginx/fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            fastcgi_index index.php;
             fastcgi_pass 127.0.0.1:9000;
-            fastcgi_read_timeout 300;
         }
 
-        location ~* \.(?:css|js|jpg|jpeg|gif|png|svg|ico|woff2?)$ {
-            expires 7d;
-            add_header Cache-Control "public, max-age=604800";
-            try_files $uri =404;
+        location ~ /\.ht {
+            deny all;
         }
     }
 }
