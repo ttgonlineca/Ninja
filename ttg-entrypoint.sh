@@ -3,33 +3,110 @@ set -eu
 
 echo "[TTG] Invoice Ninja (FPM) starting..."
 
+# Pterodactyl vars
 PORT="${PORT:-8800}"
+
+# Always-writable paths in Pterodactyl
+BASE="/home/container"
+RUNTIME="${BASE}/.runtime"
+LOGS="${BASE}/.logs"
+APP_DIR="${BASE}/app"
+
+mkdir -p "$RUNTIME" "$LOGS" "$RUNTIME/tmp" "$RUNTIME/sessions" /tmp
+
 echo "[TTG] PORT: ${PORT}"
+echo "[TTG] RUNTIME: ${RUNTIME}"
+echo "[TTG] LOGS: ${LOGS}"
+echo "[TTG] APP_DIR: ${APP_DIR}"
 
-# Writable paths in Pterodactyl
-RUNTIME_DIR="/home/container/.runtime"
-LOG_DIR="/home/container/.logs"
-mkdir -p "$RUNTIME_DIR" "$LOG_DIR" /tmp /run/php
+# ------------------------------------------------------------
+# 1) Laravel writable directories (if app exists in /home/container/app)
+# ------------------------------------------------------------
+if [ -d "$APP_DIR" ]; then
+  mkdir -p "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" \
+           "$APP_DIR/storage/logs" "$APP_DIR/storage/framework/cache" \
+           "$APP_DIR/storage/framework/sessions" "$APP_DIR/storage/framework/views" || true
 
-# ---------- Build a self-contained PHP-FPM config (no /var/log, no /etc writes) ----------
-FPM_CONF="${RUNTIME_DIR}/php-fpm.conf"
-FPM_POOL="${RUNTIME_DIR}/www.conf"
+  # Try to set perms (won't fail the container if chown isn't allowed)
+  chmod -R u+rwX,go+rX "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" 2>/dev/null || true
+fi
+
+# ------------------------------------------------------------
+# 2) Generate Nginx config (no writes to /var/cache, use /tmp)
+# ------------------------------------------------------------
+NGINX_CONF="${RUNTIME}/nginx.conf"
+
+cat > "$NGINX_CONF" <<EOF
+worker_processes  1;
+
+events { worker_connections 1024; }
+
+http {
+  include       /etc/nginx/mime.types;
+  default_type  application/octet-stream;
+
+  access_log    ${LOGS}/nginx-access.log;
+  error_log     ${LOGS}/nginx-error.log warn;
+
+  sendfile      on;
+  keepalive_timeout  65;
+
+  # Avoid /var/cache/* paths
+  client_body_temp_path /tmp/nginx_client_body;
+  proxy_temp_path       /tmp/nginx_proxy;
+  fastcgi_temp_path     /tmp/nginx_fastcgi;
+  uwsgi_temp_path       /tmp/nginx_uwsgi;
+  scgi_temp_path        /tmp/nginx_scgi;
+
+  server {
+    listen ${PORT};
+    server_name _;
+
+    root ${APP_DIR}/public;
+    index index.php index.html;
+
+    location / {
+      try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+      include fastcgi_params;
+      fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+      fastcgi_pass 127.0.0.1:9000;
+      fastcgi_read_timeout 300;
+    }
+
+    location ~ /\. {
+      deny all;
+    }
+  }
+}
+EOF
+
+mkdir -p /tmp/nginx_client_body /tmp/nginx_proxy /tmp/nginx_fastcgi /tmp/nginx_uwsgi /tmp/nginx_scgi 2>/dev/null || true
+
+echo "[TTG] Wrote nginx config: ${NGINX_CONF}"
+
+# ------------------------------------------------------------
+# 3) Build a self-contained PHP-FPM config (PID/logs/sessions to /home/container)
+# ------------------------------------------------------------
+FPM_CONF="${RUNTIME}/php-fpm.conf"
+FPM_POOL="${RUNTIME}/www.conf"
+FPM_PID="${RUNTIME}/php-fpm.pid"
 
 cat > "$FPM_CONF" <<EOF
 [global]
-pid = /run/php/php-fpm.pid
-error_log = ${LOG_DIR}/php-fpm.log
+pid = ${FPM_PID}
+error_log = ${LOGS}/php-fpm.log
 log_level = notice
+daemonize = yes
 
 include=${FPM_POOL}
 EOF
 
-cat > "$FPM_POOL" <<'EOF'
+cat > "$FPM_POOL" <<EOF
 [www]
-user = container
-group = container
-
-listen = 9000
+listen = 127.0.0.1:9000
 listen.allowed_clients = 127.0.0.1
 
 pm = dynamic
@@ -40,15 +117,26 @@ pm.max_spare_servers = 3
 
 catch_workers_output = yes
 clear_env = no
+
+; Force writable session/tmp paths
+php_admin_value[session.save_path] = ${RUNTIME}/sessions
+php_admin_value[sys_temp_dir] = ${RUNTIME}/tmp
+php_admin_value[upload_tmp_dir] = ${RUNTIME}/tmp
 EOF
 
-# ---------- Start PHP-FPM using our config ----------
+echo "[TTG] Prepared PHP-FPM config: ${FPM_CONF}"
+
+# ------------------------------------------------------------
+# 4) Start PHP-FPM using our config (no /etc writes, no /var/log, no /run)
+# ------------------------------------------------------------
 FPM_BIN="/usr/sbin/php-fpm8.2"
 [ -x "$FPM_BIN" ] || FPM_BIN="/usr/sbin/php-fpm"
 
-echo "[TTG] Starting PHP-FPM with -y ${FPM_CONF} (log: ${LOG_DIR}/php-fpm.log)..."
+echo "[TTG] Starting PHP-FPM: ${FPM_BIN}"
 "$FPM_BIN" -y "$FPM_CONF" -D
 
-# ---------- Start nginx ----------
+# ------------------------------------------------------------
+# 5) Start nginx using our config
+# ------------------------------------------------------------
 echo "[TTG] Starting nginx..."
-exec nginx -g "daemon off;"
+exec nginx -c "$NGINX_CONF" -g "daemon off;"
