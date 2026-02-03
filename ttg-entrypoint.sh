@@ -25,10 +25,12 @@ if [ -d "$APP_DIR" ]; then
   chmod -R u+rwX,go+rX "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" 2>/dev/null || true
 fi
 
-# Nginx config (absolute include paths)
+# Nginx config (absolute include paths + writable pid)
 NGINX_CONF="${RUNTIME}/nginx.conf"
 
 cat > "$NGINX_CONF" <<EOF
+pid ${RUNTIME}/nginx.pid;
+
 worker_processes  1;
 
 events { worker_connections 1024; }
