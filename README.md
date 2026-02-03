@@ -30,3 +30,10 @@ Start order:
 1) Redis
 2) Invoice Ninja app
 3) Worker
+<<<<<<< HEAD
+=======
+
+
+## Note
+This image includes `mariadb-client` so any optional import/load steps that call `mysql` work inside Pterodactyl.
+>>>>>>> 003f935 (Bake mariadb-client into image (mysql CLI required))
