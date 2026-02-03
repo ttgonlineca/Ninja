@@ -1,69 +1,45 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 echo "[TTG] Invoice Ninja (FPM) starting..."
-echo "[TTG] APP_DIR: /home/container/app"
 
-APP_DIR="/home/container/app"
-SRC_DIR="/opt/invoiceninja-ro"
+APP_DIR="${APP_DIR:-/home/container/app}"
+PORT="${PORT:-8800}"
 
-# Pterodactyl usually injects SERVER_PORT; fall back to PORT; then default
-PORT="${SERVER_PORT:-${PORT:-8800}}"
+echo "[TTG] APP_DIR: ${APP_DIR}"
 echo "[TTG] PORT: ${PORT}"
 
-mkdir -p /home/container/nginx
+# ---- Paths ----
+TEMPLATE_IN_APP="${APP_DIR}/nginx.conf.template"
+NGINX_CONF="/etc/nginx/nginx.conf"
 
-# Copy app on first run
-if [ ! -f "${APP_DIR}/artisan" ]; then
-  echo "[TTG] First run: copying app into ${APP_DIR}"
-  mkdir -p "${APP_DIR}"
-  cp -a "${SRC_DIR}/." "${APP_DIR}/"
+# ---- Ensure runtime dirs exist ----
+mkdir -p /run/php /tmp
+
+# ---- Render nginx config ----
+# Prefer template shipped with app (repo root), fallback to existing nginx.conf.
+if [ -f "$TEMPLATE_IN_APP" ]; then
+  # Replace common placeholders if present; safe if not present.
+  sed \
+    -e "s|__PORT__|${PORT}|g" \
+    -e "s|{{PORT}}|${PORT}|g" \
+    -e "s|\${PORT}|${PORT}|g" \
+    "$TEMPLATE_IN_APP" > "$NGINX_CONF"
+  echo "[TTG] Wrote nginx.conf from ${TEMPLATE_IN_APP}"
+else
+  echo "[TTG] WARN: nginx.conf.template not found at ${TEMPLATE_IN_APP}. Using existing ${NGINX_CONF}."
 fi
 
-# Ensure required writable dirs
-mkdir -p "${APP_DIR}/storage" "${APP_DIR}/bootstrap/cache"
-chmod -R 777 "${APP_DIR}/storage" "${APP_DIR}/bootstrap/cache" || true
-
-# Ensure .env exists
-if [ ! -f "${APP_DIR}/.env" ]; then
-  if [ -f "${APP_DIR}/.env.example" ]; then
-    cp "${APP_DIR}/.env.example" "${APP_DIR}/.env"
-  else
-    touch "${APP_DIR}/.env"
-  fi
+# ---- Start PHP-FPM ----
+# Debian php-fpm binary path
+PHP_FPM_BIN="/usr/sbin/php-fpm8.2"
+if [ ! -x "$PHP_FPM_BIN" ]; then
+  PHP_FPM_BIN="/usr/sbin/php-fpm"
 fi
 
-# If Ptero provides APP_KEY, enforce it into .env
-if [ -n "${APP_KEY:-}" ]; then
-  if grep -q '^APP_KEY=' "${APP_DIR}/.env"; then
-    sed -i "s|^APP_KEY=.*|APP_KEY=${APP_KEY}|" "${APP_DIR}/.env"
-  else
-    echo "APP_KEY=${APP_KEY}" >> "${APP_DIR}/.env"
-  fi
-fi
+echo "[TTG] Starting PHP-FPM..."
+$PHP_FPM_BIN -D
 
-# IMPORTANT: Pterodactyl runtime env should win
-# (prevents old .env values overriding panel variables)
-export DB_HOST="${DB_HOST:-}"
-export DB_PORT="${DB_PORT:-}"
-export DB_DATABASE="${DB_DATABASE:-}"
-export DB_USERNAME="${DB_USERNAME:-}"
-export DB_PASSWORD="${DB_PASSWORD:-}"
-export REDIS_HOST="${REDIS_HOST:-}"
-export REDIS_PORT="${REDIS_PORT:-}"
-export CACHE_DRIVER="${CACHE_DRIVER:-}"
-export SESSION_DRIVER="${SESSION_DRIVER:-}"
-export QUEUE_CONNECTION="${QUEUE_CONNECTION:-}"
-
-# Render nginx config
-env PORT="${PORT}" envsubst < /opt/ttg/nginx.conf.template > /home/container/nginx/nginx.conf
-echo "[TTG] Rendered nginx config: /home/container/nginx/nginx.conf"
-
-# Point nginx to our rendered config
-# Use -c to load our config directly, avoid writing into /etc (read-only in Ptero sometimes)
-export NGINX_CONF="/home/container/nginx/nginx.conf"
-sed -i 's|command=/usr/sbin/nginx -g "daemon off;"|command=/usr/sbin/nginx -c /home/container/nginx/nginx.conf -g "daemon off;"|' \
-  /etc/supervisor/supervisord.conf || true
-
-echo "[TTG] Starting Supervisor"
-exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
+# ---- Start nginx ----
+echo "[TTG] Starting nginx..."
+exec nginx -g "daemon off;"
