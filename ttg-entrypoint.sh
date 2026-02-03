@@ -3,9 +3,12 @@ set -euo pipefail
 
 log() { echo "[TTG] $*"; }
 
-# ----------------------------
-# Paths / defaults
-# ----------------------------
+# ==============================
+# TTG - Invoice Ninja Entrypoint
+# Web + Worker capable
+# ==============================
+
+# ---- Runtime paths ----
 PORT="${PORT:-8800}"
 RUNTIME="/home/container/.runtime"
 LOGDIR="/home/container/.logs"
@@ -13,7 +16,17 @@ APP_DIR="/home/container/app"
 
 mkdir -p "$RUNTIME" "$LOGDIR"
 
-log "Invoice Ninja (FPM) starting..."
+# ---- Role (future-proof) ----
+# Keep using separate Pterodactyl servers if you want.
+# This just makes the image portable.
+ROLE="${ROLE:-web}"          # web | worker | scheduler
+QUEUE_NAME="${QUEUE_NAME:-default}"
+QUEUE_SLEEP="${QUEUE_SLEEP:-3}"
+QUEUE_TRIES="${QUEUE_TRIES:-3}"
+QUEUE_TIMEOUT="${QUEUE_TIMEOUT:-90}"
+
+log "Invoice Ninja starting..."
+log "ROLE: ${ROLE}"
 log "PORT: ${PORT}"
 log "RUNTIME: ${RUNTIME}"
 log "LOGS: ${LOGDIR}"
@@ -22,20 +35,18 @@ log "APP_DIR: ${APP_DIR}"
 # ----------------------------
 # Proxy + URL sanity
 # ----------------------------
-# We never want the app to "discover" itself via LAN/Tailscale and bake that into URLs.
 : "${APP_URL:?ERROR: APP_URL must be set (example: https://billing.ttgonline.ca)}"
 : "${TRUSTED_PROXIES:=*}"
 : "${REQUIRE_HTTPS:=true}"
 
 export APP_URL TRUSTED_PROXIES REQUIRE_HTTPS
 
-# Optional safe defaults
 : "${APP_ENV:=production}"
 : "${APP_DEBUG:=false}"
 export APP_ENV APP_DEBUG
 
 # ----------------------------
-# Ensure .env contains the non-secret URL/proxy values
+# Ensure .env contains non-secret URL/proxy values
 # ----------------------------
 ensure_env_kv() {
   local key="$1" val="$2" envfile="${3:-$APP_DIR/.env}"
@@ -56,48 +67,63 @@ ensure_env_kv "APP_ENV" "${APP_ENV}"
 ensure_env_kv "APP_DEBUG" "${APP_DEBUG}"
 
 # ----------------------------
-# Fix company_logo on boot (safe + generic)
+# DB helper (no secrets printed)
 # ----------------------------
-# Converts any absolute logo URL (http(s)://.../storage/... OR 100.x.x.x/storage/...)
-# into a relative /storage/... so it works on any domain/server.
-fix_company_logo_urls() {
-  command -v mysql >/dev/null 2>&1 || { log "mysql client not found - skipping logo fix"; return 0; }
-
+db_params_from_env() {
+  # Primary env names
   local db_host="${DB_HOST:-}"
   local db_port="${DB_PORT:-}"
   local db_name="${DB_DATABASE:-}"
   local db_user="${DB_USERNAME:-}"
   local db_pass="${DB_PASSWORD:-}"
 
-  # If you use different env var names, add them here (fallbacks)
+  # Common fallbacks
   [ -n "$db_host" ] || db_host="${MYSQL_HOST:-}"
   [ -n "$db_port" ] || db_port="${MYSQL_PORT:-}"
   [ -n "$db_name" ] || db_name="${MYSQL_DATABASE:-}"
   [ -n "$db_user" ] || db_user="${MYSQL_USER:-}"
   [ -n "$db_pass" ] || db_pass="${MYSQL_PASSWORD:-}"
 
-  # Need full creds
+  echo "${db_host}|${db_port}|${db_name}|${db_user}|${db_pass}"
+}
+
+# ----------------------------
+# Fix company_logo stored with absolute URL/IP
+# ----------------------------
+fix_company_logo_urls() {
+  command -v mysql >/dev/null 2>&1 || { log "mysql client not found - skipping logo fix"; return 0; }
+
+  IFS="|" read -r db_host db_port db_name db_user db_pass < <(db_params_from_env)
+
   [ -n "$db_host" ] && [ -n "$db_port" ] && [ -n "$db_name" ] && [ -n "$db_user" ] && [ -n "$db_pass" ] || {
     log "DB env vars missing - skipping logo fix"
     return 0
   }
 
-  # Avoid password on CLI args (won't echo); still treat env as sensitive
   export MYSQL_PWD="$db_pass"
 
-  # Only run if it appears necessary
+  # Fix if company_logo is absolute:
+  # - "http.../storage/..." -> "/storage/..."
+  # - "100.x.x.x/storage/..." or "192.x.x.x/storage/..." etc -> "/storage/..."
+  #
+  # Approach:
+  # 1) only run if we detect it
+  # 2) use REGEXP_REPLACE to rewrite the JSON value prefix safely
   local needs_fix="0"
   needs_fix="$(mysql -N -h "$db_host" -P "$db_port" -u "$db_user" "$db_name" -e \
     "SELECT COUNT(*) FROM companies
      WHERE settings LIKE '%\"company_logo\"%'
-       AND (settings LIKE '%\"company_logo\":\"http%'
-            OR settings REGEXP '\"company_logo\":\"[0-9]{1,3}\\.[0-9]{1,3}');" 2>/dev/null || echo "0")"
+       AND (
+         settings LIKE '%\"company_logo\":\"http%'
+         OR settings REGEXP '\"company_logo\":\"[0-9]{1,3}\\.[0-9]{1,3}'
+       );" 2>/dev/null || echo "0")"
 
   if [ "${needs_fix:-0}" != "0" ]; then
-    log "Normalizing company_logo to relative /storage/... (was absolute)"
+    log "Normalizing company_logo to relative /storage/... (portable across servers)"
     mysql -h "$db_host" -P "$db_port" -u "$db_user" "$db_name" -e \
       "UPDATE companies
-       SET settings = REGEXP_REPLACE(settings,
+       SET settings = REGEXP_REPLACE(
+         settings,
          '\"company_logo\":\"[^\\\"]*\\/storage\\/',
          '\"company_logo\":\"\\/storage\\/'
        )
@@ -110,23 +136,55 @@ fix_company_logo_urls() {
 }
 
 # ----------------------------
-# Clear Laravel caches (prevents stale URL behavior)
+# Laravel cache hygiene
 # ----------------------------
+artisan_if_present() {
+  [ -f "$APP_DIR/artisan" ] || return 0
+  php "$APP_DIR/artisan" "$@" || true
+}
+
 clear_laravel_cache() {
   if [ -f "$APP_DIR/artisan" ]; then
     log "Clearing Laravel caches..."
-    php "$APP_DIR/artisan" optimize:clear >/dev/null 2>&1 || true
+    artisan_if_present optimize:clear >/dev/null 2>&1 || true
   fi
 }
 
-fix_company_logo_urls
-clear_laravel_cache
+# ----------------------------
+# Worker/Scheduler roles
+# ----------------------------
+run_worker() {
+  log "Starting queue worker (queue=${QUEUE_NAME})..."
+  fix_company_logo_urls
+  clear_laravel_cache
+
+  # Ensure queue uses redis if configured
+  artisan_if_present queue:work \
+    --queue="$QUEUE_NAME" \
+    --sleep="$QUEUE_SLEEP" \
+    --tries="$QUEUE_TRIES" \
+    --timeout="$QUEUE_TIMEOUT"
+}
+
+run_scheduler() {
+  log "Starting scheduler..."
+  fix_company_logo_urls
+  clear_laravel_cache
+
+  # schedule:work is preferred for containers (keeps running)
+  artisan_if_present schedule:work
+}
 
 # ----------------------------
-# Write nginx config
+# Web role: nginx + php-fpm
 # ----------------------------
-NGINX_CONF="${RUNTIME}/nginx.conf"
-cat > "$NGINX_CONF" <<EOF
+run_web() {
+  fix_company_logo_urls
+  clear_laravel_cache
+
+  # nginx config
+  NGINX_CONF="${RUNTIME}/nginx.conf"
+  cat > "$NGINX_CONF" <<EOF
 worker_processes auto;
 pid ${RUNTIME}/nginx.pid;
 
@@ -141,6 +199,9 @@ http {
 
   sendfile on;
   keepalive_timeout 65;
+
+  # uploads (logos/pdfs)
+  client_max_body_size 50m;
 
   server {
     listen ${PORT};
@@ -170,15 +231,13 @@ http {
 }
 EOF
 
-log "Wrote nginx config: ${NGINX_CONF}"
+  log "Wrote nginx config: ${NGINX_CONF}"
 
-# ----------------------------
-# Write PHP-FPM config
-# ----------------------------
-FPM_CONF="${RUNTIME}/php-fpm.conf"
-FPM_POOL="${RUNTIME}/www.conf"
+  # php-fpm config
+  FPM_CONF="${RUNTIME}/php-fpm.conf"
+  FPM_POOL="${RUNTIME}/www.conf"
 
-cat > "$FPM_CONF" <<EOF
+  cat > "$FPM_CONF" <<EOF
 [global]
 pid = ${RUNTIME}/php-fpm.pid
 error_log = ${LOGDIR}/php-fpm_error.log
@@ -187,7 +246,7 @@ daemonize = yes
 include=${FPM_POOL}
 EOF
 
-cat > "$FPM_POOL" <<EOF
+  cat > "$FPM_POOL" <<EOF
 [www]
 listen = 127.0.0.1:9000
 listen.allowed_clients = 127.0.0.1
@@ -206,13 +265,27 @@ php_admin_value[sys_temp_dir] = ${RUNTIME}/tmp
 php_admin_value[upload_tmp_dir] = ${RUNTIME}/tmp
 EOF
 
-log "Prepared PHP-FPM config: ${FPM_CONF}"
+  log "Prepared PHP-FPM config: ${FPM_CONF}"
 
-FPM_BIN="/usr/sbin/php-fpm8.2"
-[ -x "$FPM_BIN" ] || FPM_BIN="/usr/sbin/php-fpm"
+  FPM_BIN="/usr/sbin/php-fpm8.2"
+  [ -x "$FPM_BIN" ] || FPM_BIN="/usr/sbin/php-fpm"
 
-log "Starting PHP-FPM: ${FPM_BIN}"
-"$FPM_BIN" -y "$FPM_CONF" -D
+  log "Starting PHP-FPM: ${FPM_BIN}"
+  "$FPM_BIN" -y "$FPM_CONF" -D
 
-log "Starting nginx..."
-exec nginx -c "$NGINX_CONF" -g "daemon off;"
+  log "Starting nginx..."
+  exec nginx -c "$NGINX_CONF" -g "daemon off;"
+}
+
+# ----------------------------
+# Dispatch by role
+# ----------------------------
+case "$ROLE" in
+  web)       run_web ;;
+  worker)    run_worker ;;
+  scheduler) run_scheduler ;;
+  *)
+    log "ERROR: Unknown ROLE='$ROLE' (use web|worker|scheduler)"
+    exit 1
+    ;;
+esac
