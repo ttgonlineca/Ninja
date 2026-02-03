@@ -58,7 +58,7 @@ RUN chown -R container:container /home/container
 # --------------------------------------------------
 # Nginx config
 # --------------------------------------------------
-COPY docker/nginx.conf /etc/nginx/nginx.conf
+COPY nginx.conf.template /etc/nginx/nginx.conf
 
 # --------------------------------------------------
 # PHP-FPM config
@@ -68,7 +68,7 @@ RUN sed -i 's/listen = .*/listen = 9000/' /etc/php/8.2/fpm/pool.d/www.conf
 # --------------------------------------------------
 # Entrypoint
 # --------------------------------------------------
-COPY docker/ttg-entrypoint.sh /usr/local/bin/ttg-entrypoint.sh
+COPY ttg-entrypoint.sh /usr/local/bin/ttg-entrypoint.sh
 RUN chmod +x /usr/local/bin/ttg-entrypoint.sh
 
 # --------------------------------------------------
