@@ -6,7 +6,13 @@ RUNTIME_DIR="${RUNTIME_DIR:-/home/container/.runtime}"
 LOG_DIR="${LOG_DIR:-/home/container/.logs}"
 PORT="${PORT:-8800}"
 
-mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
+mkdir -p "$RUNTIME_DIR" "$LOG_DIR" \
+  "$RUNTIME_DIR/nginx" \
+  "$RUNTIME_DIR/nginx/body" \
+  "$RUNTIME_DIR/nginx/proxy" \
+  "$RUNTIME_DIR/nginx/fastcgi" \
+  "$RUNTIME_DIR/nginx/uwsgi" \
+  "$RUNTIME_DIR/nginx/scgi"
 
 CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
 if [[ -n "${CHROMIUM_BIN}" ]]; then
@@ -58,7 +64,7 @@ env[BROWSERSHOT_CHROME_PATH] = ${CHROMIUM_BIN}
 EOF
 
 # ----------------------------
-# Nginx runtime config
+# Nginx runtime config (ALL temp paths writable)
 # ----------------------------
 cat > "${RUNTIME_DIR}/nginx.conf" <<EOF
 worker_processes auto;
@@ -72,6 +78,12 @@ http {
 
   access_log ${LOG_DIR}/nginx_access.log;
   error_log  ${LOG_DIR}/nginx_error.log warn;
+
+  client_body_temp_path   ${RUNTIME_DIR}/nginx/body 1 2;
+  proxy_temp_path         ${RUNTIME_DIR}/nginx/proxy 1 2;
+  fastcgi_temp_path       ${RUNTIME_DIR}/nginx/fastcgi 1 2;
+  uwsgi_temp_path         ${RUNTIME_DIR}/nginx/uwsgi 1 2;
+  scgi_temp_path          ${RUNTIME_DIR}/nginx/scgi 1 2;
 
   sendfile on;
   keepalive_timeout 65;
@@ -104,7 +116,6 @@ EOF
 echo "[TTG] Starting PHP-FPM (/usr/sbin/php-fpm8.2)..."
 /usr/sbin/php-fpm8.2 -y "${RUNTIME_DIR}/php-fpm.conf"
 
-# wait up to ~3s for FPM to accept connections
 for i in {1..30}; do
   (echo > /dev/tcp/127.0.0.1/9000) >/dev/null 2>&1 && break
   sleep 0.1
