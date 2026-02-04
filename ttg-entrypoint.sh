@@ -9,6 +9,9 @@ LOGS="/home/container/.logs"
 
 mkdir -p "$RUNTIME" "$LOGS"
 
+# ---- FIX: Always respect Pterodactyl allocation ----
+# Ptero normally provides SERVER_PORT. Some setups only pass PORT.
+# If neither exists, fallback 8800.
 PORT="${SERVER_PORT:-${PORT:-8800}}"
 ROLE="${ROLE:-${LARAVEL_ROLE:-web}}"
 [ "$ROLE" = "app" ] && ROLE="web"
@@ -31,9 +34,7 @@ set_env_kv() {
   fi
 }
 
-# ---- FIX: You are still timing out to Redis at 192.168.0.108:6379 ----
-# That means Laravel is still configured for redis sessions/cache (and/or REDIS_URL).
-# Make web idiot-proof: disable Redis for WEB unless you explicitly allow it.
+# ---- Fix 500s: disable Redis for WEB unless explicitly allowed ----
 if [ "$ROLE" = "web" ] && [ "${TTG_WEB_REDIS:-0}" != "1" ]; then
   echo "[TTG] WARN: Disabling Redis for WEB (set TTG_WEB_REDIS=1 to allow Redis)"
   set_env_kv "SESSION_DRIVER" "file"
@@ -180,7 +181,7 @@ case "$ROLE" in
     echo "[TTG] Starting PHP-FPM..."
     php-fpm8.2 -y "$RUNTIME/php-fpm.conf" -R &
 
-    echo "[TTG] Starting nginx..."
+    echo "[TTG] Starting nginx on port ${PORT}..."
     exec nginx -c "$RUNTIME/nginx.conf" -g "daemon off;"
     ;;
 
