@@ -21,10 +21,14 @@ echo "[TTG] APP_DIR: $APP_DIR"
 
 cd "$APP_DIR" || { echo "[TTG] ERROR: APP_DIR missing: $APP_DIR"; exit 1; }
 
-# ---- FIX: Redis timeout causing 500s ----
-# Your .env points Redis to 192.168.0.108:6379 and it's unreachable from this container/network.
-# Do NOT try to sed .env (may be overwritten). Force runtime env overrides for THIS process.
-REDIS_HOST_VAL="$(grep -E '^REDIS_HOST=' .env 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '"'\''')"
+# ---- FIX: Don't crash if .env is missing or REDIS_HOST isn't present ----
+REDIS_HOST_VAL="$(
+  (grep -E '^REDIS_HOST=' .env 2>/dev/null || true) \
+  | head -n1 \
+  | cut -d= -f2- \
+  | tr -d "\"'"
+)"
+
 if [ "$REDIS_HOST_VAL" = "192.168.0.108" ]; then
   echo "[TTG] WARN: REDIS_HOST=$REDIS_HOST_VAL unreachable -> forcing file/db drivers for web boot"
   export SESSION_DRIVER="file"
