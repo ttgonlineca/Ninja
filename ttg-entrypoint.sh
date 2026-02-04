@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ----------------------------
-# TTG Invoice Ninja Entrypoint
-# ----------------------------
-
 APP_DIR="${APP_DIR:-/home/container/app}"
 RUNTIME_DIR="${RUNTIME_DIR:-/home/container/.runtime}"
 LOG_DIR="${LOG_DIR:-/home/container/.logs}"
@@ -20,6 +16,28 @@ echo "[TTG] LOGS: ${LOG_DIR}"
 echo "[TTG] APP_DIR: ${APP_DIR}"
 
 mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
+
+# ----------------------------
+# Detect php-fpm binary (differs by base image)
+# ----------------------------
+PHP_FPM_BIN=""
+for c in php-fpm php-fpm8.2 /usr/sbin/php-fpm8.2 /usr/local/sbin/php-fpm; do
+  if command -v "${c}" >/dev/null 2>&1; then
+    PHP_FPM_BIN="$(command -v "${c}")"
+    break
+  elif [[ -x "${c}" ]]; then
+    PHP_FPM_BIN="${c}"
+    break
+  fi
+done
+
+if [[ -z "${PHP_FPM_BIN}" ]]; then
+  echo "[TTG] ERROR: php-fpm binary not found (tried php-fpm/php-fpm8.2)"
+  echo "[TTG] INFO: PATH=${PATH}"
+  ls -la /usr/sbin 2>/dev/null | head -n 60 || true
+  ls -la /usr/local/sbin 2>/dev/null | head -n 60 || true
+  exit 1
+fi
 
 # ----------------------------
 # Detect Chromium for PDF
@@ -45,8 +63,6 @@ fi
 # ----------------------------
 # Redis safety for WEB
 # ----------------------------
-# Your earlier 500s were Redis timeouts; default WEB should not hard-require Redis.
-# Set TTG_WEB_REDIS=1 if you *want* WEB to use Redis.
 if [[ "${ROLE}" == "web" ]] && [[ "${TTG_WEB_REDIS:-0}" != "1" ]]; then
   echo "[TTG] WARN: Disabling Redis for WEB (set TTG_WEB_REDIS=1 to allow Redis)"
   export CACHE_DRIVER="${CACHE_DRIVER:-file}"
@@ -56,9 +72,17 @@ fi
 
 # ----------------------------
 # Build Nginx runtime config
-#   IMPORTANT: Use absolute include paths because nginx is started with -c in RUNTIME_DIR.
+#   IMPORTANT: pid + temp paths must be writable (Pterodactyl FS is often RO outside /home/container)
 # ----------------------------
+mkdir -p \
+  "${RUNTIME_DIR}/nginx/body" \
+  "${RUNTIME_DIR}/nginx/proxy" \
+  "${RUNTIME_DIR}/nginx/fastcgi" \
+  "${RUNTIME_DIR}/nginx/uwsgi" \
+  "${RUNTIME_DIR}/nginx/scgi"
+
 cat > "${RUNTIME_DIR}/nginx.conf" <<EOF
+pid ${RUNTIME_DIR}/nginx.pid;
 worker_processes  1;
 
 events { worker_connections  1024; }
@@ -73,7 +97,6 @@ http {
   sendfile        on;
   keepalive_timeout  65;
 
-  # Avoid readonly FS writes in /var/lib/nginx/*
   client_body_temp_path ${RUNTIME_DIR}/nginx/body;
   proxy_temp_path       ${RUNTIME_DIR}/nginx/proxy;
   fastcgi_temp_path     ${RUNTIME_DIR}/nginx/fastcgi;
@@ -97,26 +120,12 @@ http {
       fastcgi_param PATH_INFO \$fastcgi_path_info;
       fastcgi_pass 127.0.0.1:9000;
     }
-
-    location ~* \.(?:css|js|jpg|jpeg|gif|png|svg|ico|woff|woff2|ttf|eot)\$ {
-      expires 7d;
-      access_log off;
-      add_header Cache-Control "public";
-    }
   }
 }
 EOF
 
-mkdir -p \
-  "${RUNTIME_DIR}/nginx/body" \
-  "${RUNTIME_DIR}/nginx/proxy" \
-  "${RUNTIME_DIR}/nginx/fastcgi" \
-  "${RUNTIME_DIR}/nginx/uwsgi" \
-  "${RUNTIME_DIR}/nginx/scgi"
-
 # ----------------------------
-# Build PHP-FPM runtime config
-#   IMPORTANT: clear_env=no so the app can see CHROMIUM_PATH/CHROME_BIN, etc.
+# PHP-FPM runtime config
 # ----------------------------
 cat > "${RUNTIME_DIR}/php-fpm.conf" <<EOF
 [global]
@@ -131,10 +140,8 @@ pm.max_children = 10
 pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 3
-
 clear_env = no
 
-; Pass common chromium vars into PHP-FPM explicitly (belt + suspenders)
 env[CHROMIUM_PATH] = ${CHROMIUM_BIN}
 env[CHROME_BIN] = ${CHROMIUM_BIN}
 env[PUPPETEER_EXECUTABLE_PATH] = ${CHROMIUM_BIN}
@@ -147,16 +154,37 @@ EOF
 # ----------------------------
 if [[ ! -f "${APP_DIR}/artisan" ]]; then
   echo "[TTG] ERROR: Could not locate Laravel 'artisan' at ${APP_DIR}/artisan"
-  echo "[TTG] INFO: Listing ${APP_DIR} so we can see what's mounted:"
   ls -la "${APP_DIR}" || true
   exit 1
 fi
 
 # ----------------------------
+# Clean shutdown handling (so Stop/Restart works without 'Kill')
+# ----------------------------
+PHP_FPM_PID=""
+cleanup() {
+  echo "[TTG] Caught stop signal, shutting down..."
+  if [[ -n "${PHP_FPM_PID}" ]] && kill -0 "${PHP_FPM_PID}" 2>/dev/null; then
+    kill -TERM "${PHP_FPM_PID}" 2>/dev/null || true
+  fi
+
+  # Ask nginx to quit gracefully if it started
+  if [[ -f "${RUNTIME_DIR}/nginx.pid" ]]; then
+    nginx -c "${RUNTIME_DIR}/nginx.conf" -s quit 2>/dev/null || true
+  fi
+}
+trap cleanup TERM INT
+
+# ----------------------------
 # Start services
 # ----------------------------
-echo "[TTG] Starting PHP-FPM..."
-php-fpm -y "${RUNTIME_DIR}/php-fpm.conf" -F &
+echo "[TTG] Starting PHP-FPM (${PHP_FPM_BIN})..."
+"${PHP_FPM_BIN}" -y "${RUNTIME_DIR}/php-fpm.conf" -F &
+PHP_FPM_PID="$!"
 
 echo "[TTG] Starting nginx on port ${PORT}..."
 nginx -g "daemon off;" -c "${RUNTIME_DIR}/nginx.conf"
+
+# If nginx exits, ensure php-fpm goes down too
+cleanup
+wait "${PHP_FPM_PID}" 2>/dev/null || true
