@@ -24,7 +24,10 @@ cd "$APP_DIR" || { echo "[TTG] ERROR: APP_DIR missing: $APP_DIR"; exit 1; }
 php artisan optimize:clear >/dev/null 2>&1 || true
 php artisan storage:link >/dev/null 2>&1 || true
 
-# Nginx cannot write to /var/lib/nginx in Pterodactyl (read-only), so we force all temp paths into $RUNTIME
+# Use a writable socket path (Pterodactyl container FS makes /run read-only in some setups)
+PHP_FPM_SOCK="$RUNTIME/php-fpm.sock"
+
+# Nginx temp dirs must be writable too
 mkdir -p \
   "$RUNTIME/nginx/body" \
   "$RUNTIME/nginx/proxy" \
@@ -73,20 +76,14 @@ fastcgi_param  SERVER_NAME        $server_name;
 fastcgi_param  REDIRECT_STATUS    200;
 EOF
 
-PHP_FPM_SOCK="/run/php/php-fpm.sock"
-mkdir -p /run/php
-
 cat > "$RUNTIME/php-fpm.conf" <<EOF
 [global]
 daemonize = no
 error_log = /proc/self/fd/2
 
 [www]
-user = container
-group = container
 listen = ${PHP_FPM_SOCK}
-listen.owner = container
-listen.group = container
+listen.mode = 0666
 pm = dynamic
 pm.max_children = 10
 pm.start_servers = 2
@@ -105,7 +102,6 @@ http {
   include ${RUNTIME}/mime.types;
   default_type application/octet-stream;
 
-  # Force temp dirs into writable runtime (fixes /var/lib/nginx read-only crash)
   client_body_temp_path ${RUNTIME}/nginx/body 1 2;
   proxy_temp_path       ${RUNTIME}/nginx/proxy;
   fastcgi_temp_path     ${RUNTIME}/nginx/fastcgi;
