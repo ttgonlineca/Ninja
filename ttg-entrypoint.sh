@@ -1,20 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ----------------------------
-# Paths / defaults
-# ----------------------------
 APP_DIR="${APP_DIR:-/home/container/app}"
 RUNTIME_DIR="${RUNTIME_DIR:-/home/container/.runtime}"
 LOG_DIR="${LOG_DIR:-/home/container/.logs}"
 PORT="${PORT:-8800}"
-ROLE="${ROLE:-web}"
 
 mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
 
-# ----------------------------
-# Detect Chromium
-# ----------------------------
 CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
 if [[ -n "${CHROMIUM_BIN}" ]]; then
   echo "[TTG] Chromium detected: ${CHROMIUM_BIN}"
@@ -28,9 +21,6 @@ export PUPPETEER_EXECUTABLE_PATH="${CHROMIUM_BIN}"
 export BROWSERSHOT_CHROMIUM_PATH="${CHROMIUM_BIN}"
 export BROWSERSHOT_CHROME_PATH="${CHROMIUM_BIN}"
 
-# ----------------------------
-# Laravel logging defaults
-# ----------------------------
 export APP_DEBUG="${APP_DEBUG:-false}"
 export LOG_CHANNEL="${LOG_CHANNEL:-stderr}"
 
@@ -40,7 +30,7 @@ export LOG_CHANNEL="${LOG_CHANNEL:-stderr}"
 cat > "${RUNTIME_DIR}/php-fpm.conf" <<EOF
 [global]
 error_log = ${LOG_DIR}/php-fpm_error.log
-daemonize = no
+daemonize = yes
 
 [www]
 listen = 127.0.0.1:9000
@@ -74,9 +64,7 @@ cat > "${RUNTIME_DIR}/nginx.conf" <<EOF
 worker_processes auto;
 pid ${RUNTIME_DIR}/nginx.pid;
 
-events {
-  worker_connections 1024;
-}
+events { worker_connections 1024; }
 
 http {
   include       /etc/nginx/mime.types;
@@ -105,9 +93,7 @@ http {
       fastcgi_pass 127.0.0.1:9000;
     }
 
-    location ~ /\. {
-      deny all;
-    }
+    location ~ /\. { deny all; }
   }
 }
 EOF
@@ -118,5 +104,11 @@ EOF
 echo "[TTG] Starting PHP-FPM (/usr/sbin/php-fpm8.2)..."
 /usr/sbin/php-fpm8.2 -y "${RUNTIME_DIR}/php-fpm.conf"
 
+# wait up to ~3s for FPM to accept connections
+for i in {1..30}; do
+  (echo > /dev/tcp/127.0.0.1/9000) >/dev/null 2>&1 && break
+  sleep 0.1
+done
+
 echo "[TTG] Starting nginx on port ${PORT}..."
-nginx -c "${RUNTIME_DIR}/nginx.conf" -g "daemon off;"
+exec nginx -c "${RUNTIME_DIR}/nginx.conf" -g "daemon off;"
