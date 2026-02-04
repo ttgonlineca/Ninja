@@ -21,20 +21,32 @@ echo "[TTG] APP_DIR: $APP_DIR"
 
 cd "$APP_DIR" || { echo "[TTG] ERROR: APP_DIR missing: $APP_DIR"; exit 1; }
 
-# ---- FIX: Don't crash if .env is missing or REDIS_HOST isn't present ----
-REDIS_HOST_VAL="$(
-  (grep -E '^REDIS_HOST=' .env 2>/dev/null || true) \
-  | head -n1 \
-  | cut -d= -f2- \
-  | tr -d "\"'"
-)"
+set_env_kv() {
+  local k="$1" v="$2"
+  [ -f .env ] || return 0
+  if grep -qE "^${k}=" .env 2>/dev/null; then
+    sed -i "s|^${k}=.*|${k}=${v}|" .env || true
+  else
+    printf "\n%s=%s\n" "$k" "$v" >> .env || true
+  fi
+}
 
-if [ "$REDIS_HOST_VAL" = "192.168.0.108" ]; then
-  echo "[TTG] WARN: REDIS_HOST=$REDIS_HOST_VAL unreachable -> forcing file/db drivers for web boot"
+# ---- FIX: You are still timing out to Redis at 192.168.0.108:6379 ----
+# That means Laravel is still configured for redis sessions/cache (and/or REDIS_URL).
+# Make web idiot-proof: disable Redis for WEB unless you explicitly allow it.
+if [ "$ROLE" = "web" ] && [ "${TTG_WEB_REDIS:-0}" != "1" ]; then
+  echo "[TTG] WARN: Disabling Redis for WEB (set TTG_WEB_REDIS=1 to allow Redis)"
+  set_env_kv "SESSION_DRIVER" "file"
+  set_env_kv "CACHE_DRIVER" "file"
+  set_env_kv "QUEUE_CONNECTION" "database"
+  set_env_kv "REDIS_HOST" "127.0.0.1"
+  set_env_kv "REDIS_URL" ""
+
   export SESSION_DRIVER="file"
   export CACHE_DRIVER="file"
   export QUEUE_CONNECTION="database"
   export REDIS_HOST="127.0.0.1"
+  export REDIS_URL=""
 fi
 
 # ---- Make Laravel writable (Pterodactyl-safe) ----
