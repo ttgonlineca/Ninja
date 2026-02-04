@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 echo "[TTG] Invoice Ninja starting..."
 
-# -----------------------
-# Pterodactyl env compat
-# -----------------------
+# ----------------------------
+# Core paths
+# ----------------------------
+APP_DIR="/home/container/app"
+RUNTIME="/home/container/.runtime"
+LOGS="/home/container/.logs"
+
+mkdir -p "$RUNTIME" "$LOGS"
+
+# ----------------------------
+# Port + role
+# ----------------------------
 PORT="${SERVER_PORT:-${PORT:-8800}}"
-ROLE_RAW="${ROLE:-${LARAVEL_ROLE:-web}}"
-
-case "$ROLE_RAW" in
-  app) ROLE="web" ;;
-  web|worker|scheduler) ROLE="$ROLE_RAW" ;;
-  *) ROLE="web" ;;
-esac
-
-RUNTIME="${RUNTIME:-/home/container/.runtime}"
-LOGS="${LOGS:-/home/container/.logs}"
-APP_DIR="${APP_DIR:-/home/container/app}"
+ROLE="${ROLE:-${LARAVEL_ROLE:-web}}"
+[ "$ROLE" = "app" ] && ROLE="web"
 
 echo "[TTG] PORT: $PORT"
 echo "[TTG] ROLE: $ROLE"
@@ -25,143 +25,138 @@ echo "[TTG] RUNTIME: $RUNTIME"
 echo "[TTG] LOGS: $LOGS"
 echo "[TTG] APP_DIR: $APP_DIR"
 
-mkdir -p "$RUNTIME/tmp" "$RUNTIME/sessions" "$LOGS"
+# ----------------------------
+# Ensure we are in app dir
+# ----------------------------
+cd "$APP_DIR" || { echo "[TTG] ERROR: APP_DIR missing: $APP_DIR"; exit 1; }
 
-cd "$APP_DIR"
-
-log() { echo "[TTG] $*"; }
-
-# -----------------------
-# Fix company_logo paths
-# -----------------------
-normalize_company_logo() {
-  if [[ -z "${DB_HOST:-}" || -z "${DB_DATABASE:-}" || -z "${DB_USERNAME:-}" ]]; then
-    log "DB env missing, skipping logo normalization"
-    return
-  fi
-
-  php -r '
-$dsn = sprintf(
-  "mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4",
-  getenv("DB_HOST"),
-  getenv("DB_PORT") ?: "3306",
-  getenv("DB_DATABASE")
-);
-$pdo = new PDO($dsn, getenv("DB_USERNAME"), getenv("DB_PASSWORD") ?: "", [
-  PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
-]);
-
-$q = $pdo->query("SELECT id, settings FROM companies WHERE settings LIKE \"%company_logo%\"");
-$u = $pdo->prepare("UPDATE companies SET settings=? WHERE id=?");
-
-foreach ($q as $r) {
-  $j = json_decode($r["settings"], true);
-  if (!isset($j["company_logo"])) continue;
-
-  $logo = $j["company_logo"];
-  if (!is_string($logo) || str_starts_with($logo, "/storage/")) continue;
-
-  $p = strrpos($logo, "/storage/");
-  if ($p === false) continue;
-
-  $j["company_logo"] = "/storage/" . substr($logo, $p + 9);
-  $u->execute([json_encode($j, JSON_UNESCAPED_SLASHES), $r["id"]]);
-}
-';
-}
-
-normalize_company_logo
+# ----------------------------
+# Laravel hygiene (safe)
+# ----------------------------
 php artisan optimize:clear >/dev/null 2>&1 || true
+php artisan storage:link >/dev/null 2>&1 || true
 
-# -----------------------
-# Storage symlink
-# -----------------------
-if [[ ! -L public/storage ]]; then
-  php artisan storage:link >/dev/null 2>&1 || true
-fi
+# ----------------------------
+# Write our own fastcgi_params into .runtime
+# (Fixes nginx include path issue)
+# ----------------------------
+cat > "$RUNTIME/fastcgi_params" <<'EOF'
+fastcgi_param  QUERY_STRING       $query_string;
+fastcgi_param  REQUEST_METHOD     $request_method;
+fastcgi_param  CONTENT_TYPE       $content_type;
+fastcgi_param  CONTENT_LENGTH     $content_length;
 
-# -----------------------
-# Worker / Scheduler
-# -----------------------
-if [[ "$ROLE" == "worker" ]]; then
-  log "Starting queue worker"
-  exec php artisan queue:work --verbose --tries=3 --timeout=120
-fi
+fastcgi_param  SCRIPT_NAME        $fastcgi_script_name;
+fastcgi_param  REQUEST_URI        $request_uri;
+fastcgi_param  DOCUMENT_URI       $document_uri;
+fastcgi_param  DOCUMENT_ROOT      $document_root;
+fastcgi_param  SERVER_PROTOCOL    $server_protocol;
+fastcgi_param  REQUEST_SCHEME     $scheme;
+fastcgi_param  HTTPS              $https if_not_empty;
 
-if [[ "$ROLE" == "scheduler" ]]; then
-  log "Starting scheduler"
-  while true; do
-    php artisan schedule:run --no-interaction || true
-    sleep 60
-  done
-fi
+fastcgi_param  GATEWAY_INTERFACE  CGI/1.1;
+fastcgi_param  SERVER_SOFTWARE    nginx/$nginx_version;
 
-# -----------------------
-# WEB STACK (nginx + FPM)
-# -----------------------
-NGINX_CONF="$RUNTIME/nginx.conf"
-FPM_CONF="$RUNTIME/php-fpm.conf"
-FPM_POOL="$RUNTIME/php-fpm.pool.conf"
+fastcgi_param  REMOTE_ADDR        $remote_addr;
+fastcgi_param  REMOTE_PORT        $remote_port;
+fastcgi_param  SERVER_ADDR        $server_addr;
+fastcgi_param  SERVER_PORT        $server_port;
+fastcgi_param  SERVER_NAME        $server_name;
 
-cat > "$NGINX_CONF" <<EOF
-worker_processes 1;
-events { worker_connections 1024; }
-
-http {
-  include /etc/nginx/mime.types;
-  default_type application/octet-stream;
-  sendfile on;
-  keepalive_timeout 65;
-
-  access_log $LOGS/nginx_access.log;
-  error_log $LOGS/nginx_error.log warn;
-
-  server {
-    listen $PORT;
-    root $APP_DIR/public;
-    index index.php;
-
-    location / {
-      try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-
-    location ~ \.php\$ {
-      try_files \$uri =404;
-      include fastcgi_params;
-      fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-      fastcgi_param PATH_INFO \$fastcgi_path_info;
-      fastcgi_pass 127.0.0.1:9000;
-    }
-
-    location ~* \.(css|js|png|jpg|jpeg|gif|svg|ico|woff2?)\$ {
-      expires 365d;
-      add_header Cache-Control "public, max-age=31536000, immutable";
-    }
-  }
-}
+fastcgi_param  REDIRECT_STATUS    200;
 EOF
 
-cat > "$FPM_CONF" <<EOF
+# ----------------------------
+# PHP-FPM config
+# ----------------------------
+PHP_FPM_SOCK="/run/php/php-fpm.sock"
+mkdir -p /run/php
+
+cat > "$RUNTIME/php-fpm.conf" <<EOF
 [global]
-pid = $RUNTIME/php-fpm.pid
-error_log = $LOGS/php-fpm_error.log
-daemonize = yes
-include=$FPM_POOL
-EOF
+daemonize = no
+error_log = /proc/self/fd/2
 
-cat > "$FPM_POOL" <<EOF
 [www]
-listen = 127.0.0.1:9000
+user = container
+group = container
+listen = ${PHP_FPM_SOCK}
+listen.owner = container
+listen.group = container
 pm = dynamic
 pm.max_children = 10
 pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 3
 clear_env = no
-php_admin_value[session.save_path] = $RUNTIME/sessions
-php_admin_value[upload_tmp_dir] = $RUNTIME/tmp
-php_admin_value[sys_temp_dir] = $RUNTIME/tmp
 EOF
 
-/usr/sbin/php-fpm8.2 -y "$FPM_CONF" -D
-exec nginx -c "$NGINX_CONF" -g "daemon off;"
+# ----------------------------
+# nginx config (NO snippets, NO host includes)
+# Use absolute include path to our runtime fastcgi_params.
+# ----------------------------
+cat > "$RUNTIME/nginx.conf" <<EOF
+worker_processes 1;
+
+events { worker_connections 1024; }
+
+http {
+  include mime.types;
+  default_type application/octet-stream;
+
+  sendfile on;
+  keepalive_timeout 65;
+
+  server {
+    listen ${PORT};
+    server_name _;
+
+    root ${APP_DIR}/public;
+    index index.php index.html;
+
+    location / {
+      try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php\$ {
+      include ${RUNTIME}/fastcgi_params;
+      fastcgi_pass unix:${PHP_FPM_SOCK};
+      fastcgi_index index.php;
+      fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    }
+
+    location ~ /\. { deny all; }
+  }
+}
+EOF
+
+# ----------------------------
+# Role execution
+# ----------------------------
+case "$ROLE" in
+  web)
+    echo "[TTG] Starting PHP-FPM..."
+    php-fpm8.2 -y "$RUNTIME/php-fpm.conf" -R &
+
+    echo "[TTG] Starting nginx..."
+    exec nginx -c "$RUNTIME/nginx.conf" -g "daemon off;"
+    ;;
+
+  worker)
+    echo "[TTG] Starting queue worker..."
+    exec php artisan queue:work --sleep=3 --tries=3 --timeout=90
+    ;;
+
+  scheduler)
+    echo "[TTG] Starting scheduler loop..."
+    while true; do
+      php artisan schedule:run --no-interaction || true
+      sleep 60
+    done
+    ;;
+
+  *)
+    echo "[TTG] ERROR: Unknown ROLE '$ROLE' (use web|worker|scheduler)"
+    exit 1
+    ;;
+esac
