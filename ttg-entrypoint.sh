@@ -21,19 +21,18 @@ echo "[TTG] APP_DIR: $APP_DIR"
 
 cd "$APP_DIR" || { echo "[TTG] ERROR: APP_DIR missing: $APP_DIR"; exit 1; }
 
-# ---- FIX: ensure Laravel can write caches/sessions/logs in Pterodactyl ----
+# ---- Make Laravel writable (Pterodactyl-safe) ----
 mkdir -p storage/framework/{cache,data,sessions,testing,views} bootstrap/cache storage/logs || true
-chmod -R ug+rwX storage bootstrap/cache || true
+chmod -R 0777 storage bootstrap/cache || true
 
-# Clear stale caches that commonly cause 500s after image switches
+# Clear stale caches (safe)
 php artisan optimize:clear >/dev/null 2>&1 || true
-php artisan config:clear >/dev/null 2>&1 || true
-php artisan route:clear >/dev/null 2>&1 || true
-php artisan view:clear >/dev/null 2>&1 || true
+php artisan config:clear   >/dev/null 2>&1 || true
+php artisan route:clear    >/dev/null 2>&1 || true
+php artisan view:clear     >/dev/null 2>&1 || true
+php artisan storage:link   >/dev/null 2>&1 || true
 
-# Ensure storage symlink exists (won't fail if already present)
-php artisan storage:link >/dev/null 2>&1 || true
-
+# ---- Nginx/PHP must write to runtime, not /var or /run ----
 PHP_FPM_SOCK="$RUNTIME/php-fpm.sock"
 
 mkdir -p \
@@ -147,6 +146,10 @@ EOF
 
 case "$ROLE" in
   web)
+    # Stream Laravel logs to container output so we can see the REAL 500 cause in Pterodactyl console
+    ( touch storage/logs/laravel.log || true )
+    ( tail -n 0 -F storage/logs/laravel*.log 2>/dev/null || true ) &
+
     echo "[TTG] Starting PHP-FPM..."
     php-fpm8.2 -y "$RUNTIME/php-fpm.conf" -R &
 
