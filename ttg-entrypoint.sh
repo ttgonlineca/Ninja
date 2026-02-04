@@ -1,207 +1,166 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "[TTG] Invoice Ninja (FPM) starting..."
+
+# -----------------------
+# Pterodactyl env compat
+# -----------------------
+# Port: prefer Pterodactyl's SERVER_PORT, fallback to PORT, then 8800
+PORT="${SERVER_PORT:-${PORT:-8800}}"
+
+# Role: accept either ROLE=web|worker|scheduler OR LARAVEL_ROLE=app|worker|scheduler
+ROLE_RAW="${ROLE:-${LARAVEL_ROLE:-web}}"
+case "$ROLE_RAW" in
+  app) ROLE="web" ;;
+  web|worker|scheduler) ROLE="$ROLE_RAW" ;;
+  *) ROLE="web" ;;
+esac
+
+RUNTIME="${RUNTIME:-/home/container/.runtime}"
+LOGS="${LOGS:-/home/container/.logs}"
+APP_DIR="${APP_DIR:-/home/container/app}"
+
+echo "[TTG] PORT: ${PORT}"
+echo "[TTG] RUNTIME: ${RUNTIME}"
+echo "[TTG] LOGS: ${LOGS}"
+echo "[TTG] APP_DIR: ${APP_DIR}"
+echo "[TTG] ROLE: ${ROLE} (raw=${ROLE_RAW})"
+
+mkdir -p "${RUNTIME}" "${LOGS}"
+mkdir -p "${RUNTIME}/tmp" "${RUNTIME}/sessions" || true
+
+cd "${APP_DIR}"
+
+# -----------------------
+# Helpers
+# -----------------------
 log() { echo "[TTG] $*"; }
 
-# ==============================
-# TTG - Invoice Ninja Entrypoint
-# Web + Worker capable
-# ==============================
-
-# ---- Runtime paths ----
-PORT="${PORT:-8800}"
-RUNTIME="/home/container/.runtime"
-LOGDIR="/home/container/.logs"
-APP_DIR="/home/container/app"
-
-mkdir -p "$RUNTIME" "$LOGDIR"
-
-# ---- Role (future-proof) ----
-# Keep using separate Pterodactyl servers if you want.
-# This just makes the image portable.
-ROLE="${ROLE:-web}"          # web | worker | scheduler
-QUEUE_NAME="${QUEUE_NAME:-default}"
-QUEUE_SLEEP="${QUEUE_SLEEP:-3}"
-QUEUE_TRIES="${QUEUE_TRIES:-3}"
-QUEUE_TIMEOUT="${QUEUE_TIMEOUT:-90}"
-
-log "Invoice Ninja starting..."
-log "ROLE: ${ROLE}"
-log "PORT: ${PORT}"
-log "RUNTIME: ${RUNTIME}"
-log "LOGS: ${LOGDIR}"
-log "APP_DIR: ${APP_DIR}"
-
-# ----------------------------
-# Proxy + URL sanity
-# ----------------------------
-: "${APP_URL:?ERROR: APP_URL must be set (example: https://billing.ttgonline.ca)}"
-: "${TRUSTED_PROXIES:=*}"
-: "${REQUIRE_HTTPS:=true}"
-
-export APP_URL TRUSTED_PROXIES REQUIRE_HTTPS
-
-: "${APP_ENV:=production}"
-: "${APP_DEBUG:=false}"
-export APP_ENV APP_DEBUG
-
-# ----------------------------
-# Ensure .env contains non-secret URL/proxy values
-# ----------------------------
-ensure_env_kv() {
-  local key="$1" val="$2" envfile="${3:-$APP_DIR/.env}"
-  mkdir -p "$(dirname "$envfile")"
-  touch "$envfile"
-
-  if grep -qE "^${key}=" "$envfile"; then
-    sed -i "s|^${key}=.*|${key}=${val}|g" "$envfile"
-  else
-    echo "${key}=${val}" >> "$envfile"
-  fi
-}
-
-ensure_env_kv "APP_URL" "${APP_URL}"
-ensure_env_kv "TRUSTED_PROXIES" "${TRUSTED_PROXIES}"
-ensure_env_kv "REQUIRE_HTTPS" "${REQUIRE_HTTPS}"
-ensure_env_kv "APP_ENV" "${APP_ENV}"
-ensure_env_kv "APP_DEBUG" "${APP_DEBUG}"
-
-# ----------------------------
-# DB helper (no secrets printed)
-# ----------------------------
-db_params_from_env() {
-  # Primary env names
-  local db_host="${DB_HOST:-}"
-  local db_port="${DB_PORT:-}"
-  local db_name="${DB_DATABASE:-}"
-  local db_user="${DB_USERNAME:-}"
-  local db_pass="${DB_PASSWORD:-}"
-
-  # Common fallbacks
-  [ -n "$db_host" ] || db_host="${MYSQL_HOST:-}"
-  [ -n "$db_port" ] || db_port="${MYSQL_PORT:-}"
-  [ -n "$db_name" ] || db_name="${MYSQL_DATABASE:-}"
-  [ -n "$db_user" ] || db_user="${MYSQL_USER:-}"
-  [ -n "$db_pass" ] || db_pass="${MYSQL_PASSWORD:-}"
-
-  echo "${db_host}|${db_port}|${db_name}|${db_user}|${db_pass}"
-}
-
-# ----------------------------
-# Fix company_logo stored with absolute URL/IP
-# ----------------------------
-fix_company_logo_urls() {
-  command -v mysql >/dev/null 2>&1 || { log "mysql client not found - skipping logo fix"; return 0; }
-
-  IFS="|" read -r db_host db_port db_name db_user db_pass < <(db_params_from_env)
-
-  [ -n "$db_host" ] && [ -n "$db_port" ] && [ -n "$db_name" ] && [ -n "$db_user" ] && [ -n "$db_pass" ] || {
-    log "DB env vars missing - skipping logo fix"
-    return 0
-  }
-
-  export MYSQL_PWD="$db_pass"
-
-  # Fix if company_logo is absolute:
-  # - "http.../storage/..." -> "/storage/..."
-  # - "100.x.x.x/storage/..." or "192.x.x.x/storage/..." etc -> "/storage/..."
+normalize_company_logo_in_db() {
+  # If logo was saved as absolute/host/Tailscale/URL/etc, normalize to "/storage/<path after /storage/>"
+  # This fixes URLs like:
+  #   100.118.x.x/storage/<company_key>/<file>.png
+  #   https://billing.../storage/<company_key>/<file>.png
+  #   /settings/company_details/100.118.../storage/<company_key>/<file>.png
   #
-  # Approach:
-  # 1) only run if we detect it
-  # 2) use REGEXP_REPLACE to rewrite the JSON value prefix safely
-  local needs_fix="0"
-  needs_fix="$(mysql -N -h "$db_host" -P "$db_port" -u "$db_user" "$db_name" -e \
-    "SELECT COUNT(*) FROM companies
-     WHERE settings LIKE '%\"company_logo\"%'
-       AND (
-         settings LIKE '%\"company_logo\":\"http%'
-         OR settings REGEXP '\"company_logo\":\"[0-9]{1,3}\\.[0-9]{1,3}'
-       );" 2>/dev/null || echo "0")"
-
-  if [ "${needs_fix:-0}" != "0" ]; then
-    log "Normalizing company_logo to relative /storage/... (portable across servers)"
-    mysql -h "$db_host" -P "$db_port" -u "$db_user" "$db_name" -e \
-      "UPDATE companies
-       SET settings = REGEXP_REPLACE(
-         settings,
-         '\"company_logo\":\"[^\\\"]*\\/storage\\/',
-         '\"company_logo\":\"\\/storage\\/'
-       )
-       WHERE settings LIKE '%\"company_logo\"%';" >/dev/null 2>&1 || true
-  else
-    log "company_logo already OK (relative or not set)"
+  # Requires DB creds in env (Invoice Ninja standard):
+  # DB_HOST, DB_PORT, DB_DATABASE, DB_USERNAME, DB_PASSWORD
+  #
+  # Safe to run repeatedly.
+  if [[ -z "${DB_HOST:-}" || -z "${DB_DATABASE:-}" || -z "${DB_USERNAME:-}" ]]; then
+    log "DB vars missing; skipping company_logo normalize"
+    return 0
   fi
 
-  unset MYSQL_PWD
+  local DB_PORT_USE="${DB_PORT:-3306}"
+  log "Normalizing company_logo paths in DB (if needed)..."
+
+  # Use PHP to run the SQL because it handles quoting well and avoids shell escaping madness
+  php -r '
+$h=getenv("DB_HOST"); $p=getenv("DB_PORT")?: "3306"; $db=getenv("DB_DATABASE");
+$u=getenv("DB_USERNAME"); $pw=getenv("DB_PASSWORD")?: "";
+if(!$h||!$db||!$u){fwrite(STDERR,"missing db env\n"); exit(0);}
+$dsn="mysql:host=$h;port=$p;dbname=$db;charset=utf8mb4";
+$pdo=new PDO($dsn,$u,$pw,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
+
+// companies.settings is JSON or json-like text.
+// Normalize any company_logo value that contains "/storage/" but isn’t starting with "/storage/".
+$sql="SELECT id, settings FROM companies WHERE settings LIKE \"%company_logo%\"";
+$st=$pdo->query($sql);
+$upd=$pdo->prepare("UPDATE companies SET settings=? WHERE id=?");
+
+$count=0;
+while($row=$st->fetch(PDO::FETCH_ASSOC)){
+  $id=$row["id"];
+  $settings=$row["settings"];
+  if(!$settings) continue;
+
+  $j=json_decode($settings,true);
+  if(!is_array($j)) continue;
+  if(!isset($j["company_logo"])) continue;
+
+  $logo=$j["company_logo"];
+  if(!is_string($logo) || $logo==="") continue;
+
+  // Find the last occurrence of "/storage/" and rebuild as "/storage/<tail>"
+  $pos=strrpos($logo,"/storage/");
+  if($pos===false) continue;
+
+  $tail=substr($logo,$pos+strlen("/storage/"));
+  $new="/storage/".$tail;
+
+  if($logo === $new) continue;
+
+  $j["company_logo"]=$new;
+  $newSettings=json_encode($j, JSON_UNESCAPED_SLASHES);
+  $upd->execute([$newSettings,$id]);
+  $count++;
+}
+echo "updated=$count\n";
+' || true
 }
 
-# ----------------------------
-# Laravel cache hygiene
-# ----------------------------
-artisan_if_present() {
-  [ -f "$APP_DIR/artisan" ] || return 0
-  php "$APP_DIR/artisan" "$@" || true
+laravel_optimize_clear() {
+  log "Clearing Laravel caches..."
+  php artisan optimize:clear >/dev/null 2>&1 || true
 }
 
-clear_laravel_cache() {
-  if [ -f "$APP_DIR/artisan" ]; then
-    log "Clearing Laravel caches..."
-    artisan_if_present optimize:clear >/dev/null 2>&1 || true
+# -----------------------
+# Storage symlink sanity
+# -----------------------
+if [[ -d "${APP_DIR}/public" && -d "${APP_DIR}/storage/app/public" ]]; then
+  if [[ ! -L "${APP_DIR}/public/storage" ]]; then
+    log "Creating public/storage symlink..."
+    php artisan storage:link >/dev/null 2>&1 || true
   fi
-}
+fi
 
-# ----------------------------
-# Worker/Scheduler roles
-# ----------------------------
-run_worker() {
-  log "Starting queue worker (queue=${QUEUE_NAME})..."
-  fix_company_logo_urls
-  clear_laravel_cache
+# Always attempt to normalize logo paths and clear caches on boot
+normalize_company_logo_in_db
+laravel_optimize_clear
 
-  # Ensure queue uses redis if configured
-  artisan_if_present queue:work \
-    --queue="$QUEUE_NAME" \
-    --sleep="$QUEUE_SLEEP" \
-    --tries="$QUEUE_TRIES" \
-    --timeout="$QUEUE_TIMEOUT"
-}
+# -----------------------
+# ROLE: worker / scheduler
+# -----------------------
+if [[ "${ROLE}" == "worker" ]]; then
+  log "Starting QUEUE worker..."
+  exec php artisan queue:work --verbose --tries=3 --timeout=120
+fi
 
-run_scheduler() {
-  log "Starting scheduler..."
-  fix_company_logo_urls
-  clear_laravel_cache
+if [[ "${ROLE}" == "scheduler" ]]; then
+  log "Starting scheduler loop..."
+  while true; do
+    php artisan schedule:run --verbose --no-interaction || true
+    sleep 60
+  done
+fi
 
-  # schedule:work is preferred for containers (keeps running)
-  artisan_if_present schedule:work
-}
+# -----------------------
+# ROLE: web (nginx + php-fpm)
+# -----------------------
+log "Starting web stack (nginx + php-fpm)..."
 
-# ----------------------------
-# Web role: nginx + php-fpm
-# ----------------------------
-run_web() {
-  fix_company_logo_urls
-  clear_laravel_cache
+NGINX_CONF="${RUNTIME}/nginx.conf"
+FPM_CONF="${RUNTIME}/php-fpm.conf"
+FPM_POOL="${RUNTIME}/php-fpm.pool.conf"
 
-  # nginx config
-  NGINX_CONF="${RUNTIME}/nginx.conf"
-  cat > "$NGINX_CONF" <<EOF
-worker_processes auto;
-pid ${RUNTIME}/nginx.pid;
+cat > "${NGINX_CONF}" <<EOF
+worker_processes  1;
 
-events { worker_connections 1024; }
+events { worker_connections  1024; }
 
 http {
   include       /etc/nginx/mime.types;
   default_type  application/octet-stream;
 
-  access_log ${LOGDIR}/nginx_access.log;
-  error_log  ${LOGDIR}/nginx_error.log warn;
+  sendfile        on;
+  keepalive_timeout  65;
 
-  sendfile on;
-  keepalive_timeout 65;
+  client_max_body_size 128m;
 
-  # uploads (logos/pdfs)
-  client_max_body_size 50m;
+  access_log  ${LOGS}/nginx_access.log;
+  error_log   ${LOGS}/nginx_error.log warn;
 
   server {
     listen ${PORT};
@@ -210,43 +169,40 @@ http {
     root ${APP_DIR}/public;
     index index.php index.html;
 
-    # Storage: logos, PDFs, uploads
-    location /storage/ {
-      try_files \$uri \$uri/ /index.php?\$query_string;
-      expires 365d;
-      add_header Cache-Control "public, max-age=31536000, immutable";
-    }
-
     location / {
       try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
-    location ~ \.php\$ {
-      include snippets/fastcgi-php.conf;
-      fastcgi_pass 127.0.0.1:9000;
-      fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    location ~ \.php$ {
+      try_files \$uri =404;
       include fastcgi_params;
+      fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+      fastcgi_param PATH_INFO \$fastcgi_path_info;
+      fastcgi_index index.php;
+      fastcgi_pass 127.0.0.1:9000;
+    }
+
+    location ~* \.(?:css|js|jpg|jpeg|gif|png|svg|ico|woff2?)$ {
+      expires 365d;
+      add_header Cache-Control "public, max-age=31536000, immutable";
+      try_files \$uri \$uri/ /index.php?\$query_string;
     }
   }
 }
 EOF
 
-  log "Wrote nginx config: ${NGINX_CONF}"
+log "Wrote nginx config: ${NGINX_CONF}"
 
-  # php-fpm config
-  FPM_CONF="${RUNTIME}/php-fpm.conf"
-  FPM_POOL="${RUNTIME}/www.conf"
-
-  cat > "$FPM_CONF" <<EOF
+cat > "${FPM_CONF}" <<EOF
 [global]
 pid = ${RUNTIME}/php-fpm.pid
-error_log = ${LOGDIR}/php-fpm_error.log
+error_log = ${LOGS}/php-fpm_error.log
 daemonize = yes
 
 include=${FPM_POOL}
 EOF
 
-  cat > "$FPM_POOL" <<EOF
+cat > "${FPM_POOL}" <<EOF
 [www]
 listen = 127.0.0.1:9000
 listen.allowed_clients = 127.0.0.1
@@ -265,27 +221,13 @@ php_admin_value[sys_temp_dir] = ${RUNTIME}/tmp
 php_admin_value[upload_tmp_dir] = ${RUNTIME}/tmp
 EOF
 
-  log "Prepared PHP-FPM config: ${FPM_CONF}"
+log "Prepared PHP-FPM config: ${FPM_CONF}"
 
-  FPM_BIN="/usr/sbin/php-fpm8.2"
-  [ -x "$FPM_BIN" ] || FPM_BIN="/usr/sbin/php-fpm"
+FPM_BIN="/usr/sbin/php-fpm8.2"
+[[ -x "${FPM_BIN}" ]] || FPM_BIN="/usr/sbin/php-fpm"
 
-  log "Starting PHP-FPM: ${FPM_BIN}"
-  "$FPM_BIN" -y "$FPM_CONF" -D
+log "Starting PHP-FPM: ${FPM_BIN}"
+"${FPM_BIN}" -y "${FPM_CONF}" -D
 
-  log "Starting nginx..."
-  exec nginx -c "$NGINX_CONF" -g "daemon off;"
-}
-
-# ----------------------------
-# Dispatch by role
-# ----------------------------
-case "$ROLE" in
-  web)       run_web ;;
-  worker)    run_worker ;;
-  scheduler) run_scheduler ;;
-  *)
-    log "ERROR: Unknown ROLE='$ROLE' (use web|worker|scheduler)"
-    exit 1
-    ;;
-esac
+log "Starting nginx..."
+exec nginx -c "${NGINX_CONF}" -g "daemon off;"
