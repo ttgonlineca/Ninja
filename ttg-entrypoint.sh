@@ -1,193 +1,84 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ----------------------------
+# TTG Invoice Ninja Entrypoint
+# ----------------------------
+
+APP_DIR="${APP_DIR:-/home/container/app}"
+RUNTIME_DIR="${RUNTIME_DIR:-/home/container/.runtime}"
+LOG_DIR="${LOG_DIR:-/home/container/.logs}"
+
+ROLE="${ROLE:-${TTG_ROLE:-web}}"
+PORT="${SERVER_PORT:-${PORT:-8000}}"
+
 echo "[TTG] Invoice Ninja starting..."
+echo "[TTG] PORT: ${PORT}"
+echo "[TTG] ROLE: ${ROLE}"
+echo "[TTG] RUNTIME: ${RUNTIME_DIR}"
+echo "[TTG] LOGS: ${LOG_DIR}"
+echo "[TTG] APP_DIR: ${APP_DIR}"
 
-APP_DIR="/home/container/app"
-RUNTIME="/home/container/.runtime"
-LOGS="/home/container/.logs"
+mkdir -p "${RUNTIME_DIR}" "${LOG_DIR}"
 
-mkdir -p "$RUNTIME" "$LOGS"
+# ----------------------------
+# Detect Chromium for PDF
+# ----------------------------
+CHROMIUM_BIN=""
+if command -v chromium >/dev/null 2>&1; then
+  CHROMIUM_BIN="$(command -v chromium)"
+elif command -v chromium-browser >/dev/null 2>&1; then
+  CHROMIUM_BIN="$(command -v chromium-browser)"
+fi
 
-# ---- Pterodactyl port allocation ----
-PORT="${SERVER_PORT:-${PORT:-8800}}"
-
-# ---- Role handling ----
-ROLE="${ROLE:-${LARAVEL_ROLE:-web}}"
-[ "$ROLE" = "app" ] && ROLE="web"
-
-echo "[TTG] PORT: $PORT"
-echo "[TTG] ROLE: $ROLE"
-echo "[TTG] RUNTIME: $RUNTIME"
-echo "[TTG] LOGS: $LOGS"
-echo "[TTG] APP_DIR: $APP_DIR"
-
-cd "$APP_DIR" || { echo "[TTG] ERROR: APP_DIR missing: $APP_DIR"; exit 1; }
-
-set_env_kv() {
-  local k="$1" v="$2"
-  [ -f .env ] || return 0
-  if grep -qE "^${k}=" .env 2>/dev/null; then
-    sed -i "s|^${k}=.*|${k}=${v}|" .env || true
-  else
-    printf "\n%s=%s\n" "$k" "$v" >> .env || true
-  fi
-}
-
-# ------------------------------------------------------------
-# FIX: PDF Preview (Chromium path)
-# Invoice Ninja's Browsershot/Puppeteer needs an explicit binary path
-# in containers, especially as non-root.
-# ------------------------------------------------------------
-detect_chromium() {
-  local p=""
-  for cand in \
-    "/usr/bin/chromium" \
-    "/usr/bin/chromium-browser" \
-    "/usr/bin/google-chrome" \
-    "/usr/bin/google-chrome-stable" \
-    "/snap/bin/chromium" \
-    "/opt/google/chrome/chrome"
-  do
-    if [ -x "$cand" ]; then p="$cand"; break; fi
-  done
-  echo "$p"
-}
-
-CHROME_BIN="$(detect_chromium || true)"
-if [ -n "${CHROME_BIN}" ]; then
-  echo "[TTG] Chromium detected: ${CHROME_BIN}"
-  export CHROME_PATH="${CHROME_BIN}"
-  export CHROMIUM_PATH="${CHROME_BIN}"
-  export PUPPETEER_EXECUTABLE_PATH="${CHROME_BIN}"
-  # Common env keys various libs look for:
-  set_env_kv "CHROME_PATH" "${CHROME_BIN}"
-  set_env_kv "CHROMIUM_PATH" "${CHROME_BIN}"
-  set_env_kv "PUPPETEER_EXECUTABLE_PATH" "${CHROME_BIN}"
-  set_env_kv "BROWSERSHOT_CHROME_PATH" "${CHROME_BIN}"
+if [[ -n "${CHROMIUM_BIN}" ]]; then
+  echo "[TTG] Chromium detected: ${CHROMIUM_BIN}"
+  export CHROMIUM_PATH="${CHROMIUM_BIN}"
+  export CHROME_BIN="${CHROMIUM_BIN}"
+  export PUPPETEER_EXECUTABLE_PATH="${CHROMIUM_BIN}"
+  export BROWSERSHOT_CHROMIUM_PATH="${CHROMIUM_BIN}"
+  export BROWSERSHOT_CHROME_PATH="${CHROMIUM_BIN}"
 else
-  echo "[TTG] WARN: Chromium NOT found in image. PDF preview will fail until installed."
+  echo "[TTG] WARN: Chromium not found in PATH (PDF preview may fail)"
 fi
 
-# ------------------------------------------------------------
-# Fix 500s: disable Redis for WEB unless explicitly allowed
-# ------------------------------------------------------------
-if [ "$ROLE" = "web" ] && [ "${TTG_WEB_REDIS:-0}" != "1" ]; then
+# ----------------------------
+# Redis safety for WEB
+# ----------------------------
+# Your earlier 500s were Redis timeouts; default WEB should not hard-require Redis.
+# Set TTG_WEB_REDIS=1 if you *want* WEB to use Redis.
+if [[ "${ROLE}" == "web" ]] && [[ "${TTG_WEB_REDIS:-0}" != "1" ]]; then
   echo "[TTG] WARN: Disabling Redis for WEB (set TTG_WEB_REDIS=1 to allow Redis)"
-  set_env_kv "SESSION_DRIVER" "file"
-  set_env_kv "CACHE_DRIVER" "file"
-  set_env_kv "QUEUE_CONNECTION" "database"
-  set_env_kv "REDIS_HOST" "127.0.0.1"
-  set_env_kv "REDIS_URL" ""
-
-  export SESSION_DRIVER="file"
-  export CACHE_DRIVER="file"
-  export QUEUE_CONNECTION="database"
-  export REDIS_HOST="127.0.0.1"
-  export REDIS_URL=""
+  export CACHE_DRIVER="${CACHE_DRIVER:-file}"
+  export SESSION_DRIVER="${SESSION_DRIVER:-file}"
+  export QUEUE_CONNECTION="${QUEUE_CONNECTION:-sync}"
 fi
 
-# ---- Make Laravel writable (Pterodactyl-safe) ----
-mkdir -p storage/framework/{cache,data,sessions,testing,views} bootstrap/cache storage/logs || true
-chmod -R 0777 storage bootstrap/cache || true
+# ----------------------------
+# Build Nginx runtime config
+#   IMPORTANT: Use absolute include paths because nginx is started with -c in RUNTIME_DIR.
+# ----------------------------
+cat > "${RUNTIME_DIR}/nginx.conf" <<EOF
+worker_processes  1;
 
-# Clear stale caches (safe)
-php artisan optimize:clear >/dev/null 2>&1 || true
-php artisan config:clear   >/dev/null 2>&1 || true
-php artisan route:clear    >/dev/null 2>&1 || true
-php artisan view:clear     >/dev/null 2>&1 || true
-php artisan storage:link   >/dev/null 2>&1 || true
-
-# ------------------------------------------------------------
-# Runtime-only nginx/php-fpm paths (no /var, no /run)
-# ------------------------------------------------------------
-PHP_FPM_SOCK="$RUNTIME/php-fpm.sock"
-
-mkdir -p \
-  "$RUNTIME/nginx/body" \
-  "$RUNTIME/nginx/proxy" \
-  "$RUNTIME/nginx/fastcgi" \
-  "$RUNTIME/nginx/uwsgi" \
-  "$RUNTIME/nginx/scgi"
-
-cat > "$RUNTIME/mime.types" <<'EOF'
-types {
-    text/html html htm shtml;
-    text/css css;
-    application/javascript js;
-    application/json json;
-    image/svg+xml svg svgz;
-    image/png png;
-    image/jpeg jpeg jpg;
-    image/gif gif;
-    image/webp webp;
-    application/octet-stream bin exe dll;
-}
-EOF
-
-cat > "$RUNTIME/fastcgi_params" <<'EOF'
-fastcgi_param  QUERY_STRING       $query_string;
-fastcgi_param  REQUEST_METHOD     $request_method;
-fastcgi_param  CONTENT_TYPE       $content_type;
-fastcgi_param  CONTENT_LENGTH     $content_length;
-
-fastcgi_param  SCRIPT_NAME        $fastcgi_script_name;
-fastcgi_param  REQUEST_URI        $request_uri;
-fastcgi_param  DOCUMENT_URI       $document_uri;
-fastcgi_param  DOCUMENT_ROOT      $document_root;
-fastcgi_param  SERVER_PROTOCOL    $server_protocol;
-fastcgi_param  REQUEST_SCHEME     $scheme;
-fastcgi_param  HTTPS              $https if_not_empty;
-
-fastcgi_param  GATEWAY_INTERFACE  CGI/1.1;
-fastcgi_param  SERVER_SOFTWARE    nginx/$nginx_version;
-
-fastcgi_param  REMOTE_ADDR        $remote_addr;
-fastcgi_param  REMOTE_PORT        $remote_port;
-fastcgi_param  SERVER_ADDR        $server_addr;
-fastcgi_param  SERVER_PORT        $server_port;
-fastcgi_param  SERVER_NAME        $server_name;
-
-fastcgi_param  REDIRECT_STATUS    200;
-EOF
-
-cat > "$RUNTIME/php-fpm.conf" <<EOF
-[global]
-daemonize = no
-error_log = /proc/self/fd/2
-
-[www]
-listen = ${PHP_FPM_SOCK}
-listen.mode = 0666
-pm = dynamic
-pm.max_children = 10
-pm.start_servers = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
-clear_env = no
-EOF
-
-cat > "$RUNTIME/nginx.conf" <<EOF
-worker_processes 1;
-pid ${RUNTIME}/nginx.pid;
-
-events { worker_connections 1024; }
+events { worker_connections  1024; }
 
 http {
-  include ${RUNTIME}/mime.types;
-  default_type application/octet-stream;
+  include       /etc/nginx/mime.types;
+  default_type  application/octet-stream;
 
-  client_body_temp_path ${RUNTIME}/nginx/body 1 2;
-  proxy_temp_path       ${RUNTIME}/nginx/proxy;
-  fastcgi_temp_path     ${RUNTIME}/nginx/fastcgi;
-  uwsgi_temp_path       ${RUNTIME}/nginx/uwsgi;
-  scgi_temp_path        ${RUNTIME}/nginx/scgi;
+  access_log  ${LOG_DIR}/nginx_access.log;
+  error_log   ${LOG_DIR}/nginx_error.log warn;
 
-  access_log /proc/self/fd/1;
-  error_log  /proc/self/fd/2;
+  sendfile        on;
+  keepalive_timeout  65;
 
-  sendfile on;
-  keepalive_timeout 65;
+  # Avoid readonly FS writes in /var/lib/nginx/*
+  client_body_temp_path ${RUNTIME_DIR}/nginx/body;
+  proxy_temp_path       ${RUNTIME_DIR}/nginx/proxy;
+  fastcgi_temp_path     ${RUNTIME_DIR}/nginx/fastcgi;
+  uwsgi_temp_path       ${RUNTIME_DIR}/nginx/uwsgi;
+  scgi_temp_path        ${RUNTIME_DIR}/nginx/scgi;
 
   server {
     listen ${PORT};
@@ -201,44 +92,71 @@ http {
     }
 
     location ~ \.php\$ {
-      include ${RUNTIME}/fastcgi_params;
-      fastcgi_pass unix:${PHP_FPM_SOCK};
-      fastcgi_index index.php;
+      include /etc/nginx/fastcgi_params;
       fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+      fastcgi_param PATH_INFO \$fastcgi_path_info;
+      fastcgi_pass 127.0.0.1:9000;
     }
 
-    location ~ /\. { deny all; }
+    location ~* \.(?:css|js|jpg|jpeg|gif|png|svg|ico|woff|woff2|ttf|eot)\$ {
+      expires 7d;
+      access_log off;
+      add_header Cache-Control "public";
+    }
   }
 }
 EOF
 
-case "$ROLE" in
-  web)
-    ( touch storage/logs/laravel.log || true )
-    ( tail -n 0 -F storage/logs/laravel*.log 2>/dev/null || true ) &
+mkdir -p \
+  "${RUNTIME_DIR}/nginx/body" \
+  "${RUNTIME_DIR}/nginx/proxy" \
+  "${RUNTIME_DIR}/nginx/fastcgi" \
+  "${RUNTIME_DIR}/nginx/uwsgi" \
+  "${RUNTIME_DIR}/nginx/scgi"
 
-    echo "[TTG] Starting PHP-FPM..."
-    php-fpm8.2 -y "$RUNTIME/php-fpm.conf" -R &
+# ----------------------------
+# Build PHP-FPM runtime config
+#   IMPORTANT: clear_env=no so the app can see CHROMIUM_PATH/CHROME_BIN, etc.
+# ----------------------------
+cat > "${RUNTIME_DIR}/php-fpm.conf" <<EOF
+[global]
+error_log = ${LOG_DIR}/php-fpm_error.log
+daemonize = no
 
-    echo "[TTG] Starting nginx on port ${PORT}..."
-    exec nginx -c "$RUNTIME/nginx.conf" -g "daemon off;"
-    ;;
+[www]
+listen = 127.0.0.1:9000
+listen.allowed_clients = 127.0.0.1
+pm = dynamic
+pm.max_children = 10
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
 
-  worker)
-    echo "[TTG] Starting queue worker..."
-    exec php artisan queue:work --sleep=3 --tries=3 --timeout=90
-    ;;
+clear_env = no
 
-  scheduler)
-    echo "[TTG] Starting scheduler loop..."
-    while true; do
-      php artisan schedule:run --no-interaction || true
-      sleep 60
-    done
-    ;;
+; Pass common chromium vars into PHP-FPM explicitly (belt + suspenders)
+env[CHROMIUM_PATH] = ${CHROMIUM_BIN}
+env[CHROME_BIN] = ${CHROMIUM_BIN}
+env[PUPPETEER_EXECUTABLE_PATH] = ${CHROMIUM_BIN}
+env[BROWSERSHOT_CHROMIUM_PATH] = ${CHROMIUM_BIN}
+env[BROWSERSHOT_CHROME_PATH] = ${CHROMIUM_BIN}
+EOF
 
-  *)
-    echo "[TTG] ERROR: Unknown ROLE '$ROLE' (use web|worker|scheduler)"
-    exit 1
-    ;;
-esac
+# ----------------------------
+# Sanity: app present
+# ----------------------------
+if [[ ! -f "${APP_DIR}/artisan" ]]; then
+  echo "[TTG] ERROR: Could not locate Laravel 'artisan' at ${APP_DIR}/artisan"
+  echo "[TTG] INFO: Listing ${APP_DIR} so we can see what's mounted:"
+  ls -la "${APP_DIR}" || true
+  exit 1
+fi
+
+# ----------------------------
+# Start services
+# ----------------------------
+echo "[TTG] Starting PHP-FPM..."
+php-fpm -y "${RUNTIME_DIR}/php-fpm.conf" -F &
+
+echo "[TTG] Starting nginx on port ${PORT}..."
+nginx -g "daemon off;" -c "${RUNTIME_DIR}/nginx.conf"
