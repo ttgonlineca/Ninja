@@ -9,10 +9,10 @@ LOGS="/home/container/.logs"
 
 mkdir -p "$RUNTIME" "$LOGS"
 
-# ---- FIX: Always respect Pterodactyl allocation ----
-# Ptero normally provides SERVER_PORT. Some setups only pass PORT.
-# If neither exists, fallback 8800.
+# ---- Pterodactyl port allocation ----
 PORT="${SERVER_PORT:-${PORT:-8800}}"
+
+# ---- Role handling ----
 ROLE="${ROLE:-${LARAVEL_ROLE:-web}}"
 [ "$ROLE" = "app" ] && ROLE="web"
 
@@ -34,7 +34,44 @@ set_env_kv() {
   fi
 }
 
-# ---- Fix 500s: disable Redis for WEB unless explicitly allowed ----
+# ------------------------------------------------------------
+# FIX: PDF Preview (Chromium path)
+# Invoice Ninja's Browsershot/Puppeteer needs an explicit binary path
+# in containers, especially as non-root.
+# ------------------------------------------------------------
+detect_chromium() {
+  local p=""
+  for cand in \
+    "/usr/bin/chromium" \
+    "/usr/bin/chromium-browser" \
+    "/usr/bin/google-chrome" \
+    "/usr/bin/google-chrome-stable" \
+    "/snap/bin/chromium" \
+    "/opt/google/chrome/chrome"
+  do
+    if [ -x "$cand" ]; then p="$cand"; break; fi
+  done
+  echo "$p"
+}
+
+CHROME_BIN="$(detect_chromium || true)"
+if [ -n "${CHROME_BIN}" ]; then
+  echo "[TTG] Chromium detected: ${CHROME_BIN}"
+  export CHROME_PATH="${CHROME_BIN}"
+  export CHROMIUM_PATH="${CHROME_BIN}"
+  export PUPPETEER_EXECUTABLE_PATH="${CHROME_BIN}"
+  # Common env keys various libs look for:
+  set_env_kv "CHROME_PATH" "${CHROME_BIN}"
+  set_env_kv "CHROMIUM_PATH" "${CHROME_BIN}"
+  set_env_kv "PUPPETEER_EXECUTABLE_PATH" "${CHROME_BIN}"
+  set_env_kv "BROWSERSHOT_CHROME_PATH" "${CHROME_BIN}"
+else
+  echo "[TTG] WARN: Chromium NOT found in image. PDF preview will fail until installed."
+fi
+
+# ------------------------------------------------------------
+# Fix 500s: disable Redis for WEB unless explicitly allowed
+# ------------------------------------------------------------
 if [ "$ROLE" = "web" ] && [ "${TTG_WEB_REDIS:-0}" != "1" ]; then
   echo "[TTG] WARN: Disabling Redis for WEB (set TTG_WEB_REDIS=1 to allow Redis)"
   set_env_kv "SESSION_DRIVER" "file"
@@ -61,7 +98,9 @@ php artisan route:clear    >/dev/null 2>&1 || true
 php artisan view:clear     >/dev/null 2>&1 || true
 php artisan storage:link   >/dev/null 2>&1 || true
 
-# ---- Nginx/PHP must write to runtime, not /var or /run ----
+# ------------------------------------------------------------
+# Runtime-only nginx/php-fpm paths (no /var, no /run)
+# ------------------------------------------------------------
 PHP_FPM_SOCK="$RUNTIME/php-fpm.sock"
 
 mkdir -p \
