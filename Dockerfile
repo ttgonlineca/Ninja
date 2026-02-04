@@ -26,6 +26,26 @@ RUN apt-get update \
     php8.2-intl \
     php8.2-imagick \
     mariadb-client \
+    # --------------------------------------------------
+    # Chromium (needed for live PDF preview)
+    # --------------------------------------------------
+    chromium \
+    fonts-liberation \
+    libnss3 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libgtk-3-0 \
+    libxshmfence1 \
+    libxss1 \
+    xdg-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # --------------------------------------------------
@@ -54,16 +74,6 @@ COPY . ${APP_DIR}
 # Permissions
 # --------------------------------------------------
 RUN chown -R container:container /home/container
-
-# --------------------------------------------------
-# Nginx config
-# --------------------------------------------------
-COPY nginx.conf.template /etc/nginx/nginx.conf
-
-# --------------------------------------------------
-# PHP-FPM config
-# --------------------------------------------------
-RUN sed -i 's/listen = .*/listen = 9000/' /etc/php/8.2/fpm/pool.d/www.conf
 
 # --------------------------------------------------
 # Entrypoint
