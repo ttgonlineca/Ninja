@@ -21,6 +21,18 @@ echo "[TTG] APP_DIR: $APP_DIR"
 
 cd "$APP_DIR" || { echo "[TTG] ERROR: APP_DIR missing: $APP_DIR"; exit 1; }
 
+# ---- FIX: Redis misconfig causing 500s ----
+# If Redis is unreachable, force safe local drivers so web boots.
+# (Worker can still use Redis later when you intentionally enable it.)
+if grep -qE '^REDIS_HOST=192\.168\.0\.108$' .env 2>/dev/null; then
+  echo "[TTG] WARN: REDIS_HOST points to 192.168.0.108 and is timing out. Disabling Redis for web boot."
+  # Make sessions/cache/database use file/db instead of redis to avoid hard failure
+  sed -i 's/^SESSION_DRIVER=.*/SESSION_DRIVER=file/' .env || true
+  sed -i 's/^CACHE_DRIVER=.*/CACHE_DRIVER=file/' .env || true
+  sed -i 's/^QUEUE_CONNECTION=.*/QUEUE_CONNECTION=database/' .env || true
+  sed -i 's/^REDIS_HOST=.*/REDIS_HOST=127.0.0.1/' .env || true
+fi
+
 # ---- Make Laravel writable (Pterodactyl-safe) ----
 mkdir -p storage/framework/{cache,data,sessions,testing,views} bootstrap/cache storage/logs || true
 chmod -R 0777 storage bootstrap/cache || true
@@ -146,7 +158,6 @@ EOF
 
 case "$ROLE" in
   web)
-    # Stream Laravel logs to container output so we can see the REAL 500 cause in Pterodactyl console
     ( touch storage/logs/laravel.log || true )
     ( tail -n 0 -F storage/logs/laravel*.log 2>/dev/null || true ) &
 
