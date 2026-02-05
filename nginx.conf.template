@@ -1,7 +1,6 @@
 worker_processes  1;
 
 error_log  /home/container/.logs/nginx_error.log warn;
-pid        /home/container/.runtime/nginx.pid;
 
 events {
   worker_connections  1024;
@@ -43,7 +42,7 @@ http {
       fastcgi_param PATH_INFO $fastcgi_path_info;
       fastcgi_param HTTPS off;
 
-      # IMPORTANT: TCP PHP-FPM (no unix socket, no chown issues)
+      # TCP PHP-FPM (rootless safe)
       fastcgi_pass 127.0.0.1:9000;
 
       fastcgi_read_timeout 300;
