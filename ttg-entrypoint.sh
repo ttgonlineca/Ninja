@@ -1,94 +1,104 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+RUNTIME="${RUNTIME:-/home/container/.runtime}"
+LOGS="${LOGS:-/home/container/.logs}"
 APP_DIR="${APP_DIR:-/home/container/app}"
-RUNTIME_DIR="${RUNTIME_DIR:-/home/container/.runtime}"
-LOGS_DIR="${LOGS_DIR:-/home/container/.logs}"
 PORT="${PORT:-8800}"
+
+NGINX_BIN="${NGINX_BIN:-/usr/sbin/nginx}"
+PHP_FPM_BIN="${PHP_FPM_BIN:-/usr/sbin/php-fpm8.2}"
 
 echo "[TTG] Invoice Ninja starting..."
 echo "[TTG] PORT: ${PORT}"
-echo "[TTG] RUNTIME: ${RUNTIME_DIR}"
-echo "[TTG] LOGS: ${LOGS_DIR}"
+echo "[TTG] RUNTIME: ${RUNTIME}"
+echo "[TTG] LOGS: ${LOGS}"
 echo "[TTG] APP_DIR: ${APP_DIR}"
 
-# Writable dirs required for Pterodactyl
-mkdir -p "${RUNTIME_DIR}" "${LOGS_DIR}"
-mkdir -p "${RUNTIME_DIR}/nginx/client_body" "${RUNTIME_DIR}/nginx/proxy" "${RUNTIME_DIR}/nginx/fastcgi" "${RUNTIME_DIR}/nginx/uwsgi" "${RUNTIME_DIR}/nginx/scgi"
+# Must be writable volume paths in Pterodactyl
+mkdir -p "${RUNTIME}/nginx" "${RUNTIME}/tmp" "${RUNTIME}/sessions" "${LOGS}"
 
-# Ensure ownership (Pterodactyl user is usually container/UID 999)
-chown -R container:container "${RUNTIME_DIR}" "${LOGS_DIR}" || true
-
-# Detect chromium (for PDF preview tooling if your app uses it)
+# Chromium (optional)
 if command -v chromium >/dev/null 2>&1; then
   echo "[TTG] Chromium detected: $(command -v chromium)"
+  export CHROME_BIN="$(command -v chromium)"
 elif command -v chromium-browser >/dev/null 2>&1; then
   echo "[TTG] Chromium detected: $(command -v chromium-browser)"
+  export CHROME_BIN="$(command -v chromium-browser)"
+fi
+
+# Render nginx.conf into runtime (NEVER touch /etc at runtime)
+if [[ -f "/home/container/nginx.conf.template" ]]; then
+  export PORT RUNTIME LOGS APP_DIR
+  envsubst '${PORT} ${RUNTIME} ${LOGS} ${APP_DIR}' \
+    < "/home/container/nginx.conf.template" \
+    > "${RUNTIME}/nginx.conf"
+elif [[ -f "${APP_DIR}/nginx.conf.template" ]]; then
+  export PORT RUNTIME LOGS APP_DIR
+  envsubst '${PORT} ${RUNTIME} ${LOGS} ${APP_DIR}' \
+    < "${APP_DIR}/nginx.conf.template" \
+    > "${RUNTIME}/nginx.conf"
 else
-  echo "[TTG] Chromium not found (PDF preview may fail)"
-fi
-
-# Install nginx config from template (PORT env substitution)
-if [ -f /etc/nginx/nginx.conf ]; then
-  rm -f /etc/nginx/nginx.conf || true
-fi
-
-if [ -f /home/container/nginx.conf.template ]; then
-  # Optional: allow template to live in /home/container for debugging
-  envsubst '${PORT}' < /home/container/nginx.conf.template > /etc/nginx/nginx.conf
-else
-  envsubst '${PORT}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
-fi
-
-# Ensure PHP-FPM pool config is in place (your Dockerfile should copy docker/www.conf to the right location)
-# Common locations:
-#   /etc/php/8.2/fpm/pool.d/www.conf (debian php)
-#   /usr/local/etc/php-fpm.d/www.conf (php:* images)
-# We won't overwrite here; you handle it in Dockerfile copy step.
-
-# Find PHP-FPM binary
-PHP_FPM_BIN=""
-if command -v php-fpm8.2 >/dev/null 2>&1; then
-  PHP_FPM_BIN="$(command -v php-fpm8.2)"
-elif command -v php-fpm >/dev/null 2>&1; then
-  PHP_FPM_BIN="$(command -v php-fpm)"
-elif [ -x /usr/sbin/php-fpm8.2 ]; then
-  PHP_FPM_BIN="/usr/sbin/php-fpm8.2"
-fi
-
-if [ -z "${PHP_FPM_BIN}" ]; then
-  echo "[TTG] ERROR: php-fpm binary not found"
+  echo "[TTG] ERROR: nginx.conf.template not found (expected /home/container/nginx.conf.template or ${APP_DIR}/nginx.conf.template)"
   exit 1
 fi
 
-echo "[TTG] Starting PHP-FPM (${PHP_FPM_BIN})..."
-"${PHP_FPM_BIN}" -D
+# Render php-fpm.conf into runtime (NEVER touch /etc at runtime)
+if [[ -f "/home/container/docker/php-fpm.conf" ]]; then
+  export RUNTIME LOGS
+  envsubst '${RUNTIME} ${LOGS}' \
+    < "/home/container/docker/php-fpm.conf" \
+    > "${RUNTIME}/php-fpm.conf"
+else
+  echo "[TTG] ERROR: /home/container/docker/php-fpm.conf not found"
+  exit 1
+fi
 
-# Start nginx (non-daemon so Pterodactyl can supervise)
-echo "[TTG] Starting nginx on port ${PORT}..."
-nginx -g 'daemon off;' &
-NGINX_PID=$!
+# Render pool config into runtime
+if [[ -f "/home/container/docker/www.conf" ]]; then
+  export RUNTIME LOGS
+  envsubst '${RUNTIME} ${LOGS}' \
+    < "/home/container/docker/www.conf" \
+    > "${RUNTIME}/www.conf"
+else
+  echo "[TTG] ERROR: /home/container/docker/www.conf not found"
+  exit 1
+fi
 
-# Graceful stop handling so “Stop/Restart” works (no kill needed)
-shutdown() {
-  echo "[TTG] Caught shutdown signal, stopping services..."
-  # stop nginx
-  if [ -n "${NGINX_PID:-}" ] && kill -0 "${NGINX_PID}" 2>/dev/null; then
-    kill -TERM "${NGINX_PID}" 2>/dev/null || true
+# Make sure FPM includes our pool
+# (php-fpm.conf will include ${RUNTIME}/www.conf)
+# Also ensure app exists
+if [[ ! -d "${APP_DIR}" ]]; then
+  echo "[TTG] ERROR: APP_DIR does not exist: ${APP_DIR}"
+  exit 1
+fi
+
+# Clean stale pid/socket files if any
+rm -f "${RUNTIME}/nginx.pid" "${RUNTIME}/php-fpm.pid" "${RUNTIME}/php-fpm.sock" 2>/dev/null || true
+
+# Graceful shutdown for Pterodactyl stop/restart
+terminate() {
+  echo "[TTG] Caught stop signal, shutting down..."
+
+  # Stop nginx
+  if [[ -f "${RUNTIME}/nginx.pid" ]]; then
+    "${NGINX_BIN}" -c "${RUNTIME}/nginx.conf" -s quit 2>/dev/null || true
   fi
 
-  # stop php-fpm
-  # Try common pid locations
-  if [ -f "${RUNTIME_DIR}/php-fpm.pid" ]; then
-    kill -TERM "$(cat "${RUNTIME_DIR}/php-fpm.pid")" 2>/dev/null || true
-  else
-    pkill -TERM -f 'php-fpm' 2>/dev/null || true
+  # Stop php-fpm
+  if [[ -f "${RUNTIME}/php-fpm.pid" ]]; then
+    kill -TERM "$(cat "${RUNTIME}/php-fpm.pid")" 2>/dev/null || true
   fi
 
-  wait "${NGINX_PID}" 2>/dev/null || true
-  echo "[TTG] Shutdown complete."
+  # Give them a second then exit
+  sleep 1
+  exit 0
 }
-trap shutdown SIGTERM SIGINT
+trap terminate SIGTERM SIGINT
 
-# Keep container alive tied to nginx
-wait "${NGINX_PID}"
+echo "[TTG] Starting PHP-FPM (${PHP_FPM_BIN})..."
+"${PHP_FPM_BIN}" -y "${RUNTIME}/php-fpm.conf" --fpm-config "${RUNTIME}/php-fpm.conf" -D
+
+echo "[TTG] Starting nginx on port ${PORT}..."
+# Run nginx in foreground so container stays alive and stop works
+exec "${NGINX_BIN}" -c "${RUNTIME}/nginx.conf" -g "daemon off;"
