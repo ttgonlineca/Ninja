@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------------------------------
-# TTG Invoice Ninja - Pterodactyl Entrypoint
-# Rootless safe: everything writable lives in /home/container
-# Keeps nginx in foreground so Pterodactyl stop/restart works.
-# -------------------------------
-
 export PORT="${PORT:-8800}"
 export APP_DIR="${APP_DIR:-/home/container/app}"
 export RUNTIME_DIR="${RUNTIME_DIR:-/home/container/.runtime}"
@@ -18,7 +12,6 @@ echo "[TTG] RUNTIME: ${RUNTIME_DIR}"
 echo "[TTG] LOGS: ${LOG_DIR}"
 echo "[TTG] APP_DIR: ${APP_DIR}"
 
-# --- Writable dirs ---
 mkdir -p \
   "${RUNTIME_DIR}" \
   "${RUNTIME_DIR}/nginx/client_body" \
@@ -65,13 +58,10 @@ echo "[TTG] Using nginx.conf.template from: ${TEMPLATE}"
 NGINX_CONF="${RUNTIME_DIR}/nginx.conf"
 sed "s/{{PORT}}/${PORT}/g" "${TEMPLATE}" > "${NGINX_CONF}"
 
-# --- Ensure fastcgi_params exists for include fastcgi_params ---
-# Debian nginx package usually has /etc/nginx/fastcgi_params
-# We'll copy it into runtime so nginx never needs /etc write.
+# --- Ensure fastcgi_params exists (rootless-safe include path) ---
 if [[ -f "/etc/nginx/fastcgi_params" ]]; then
   cp -f "/etc/nginx/fastcgi_params" "${RUNTIME_DIR}/fastcgi_params"
 else
-  # Minimal fallback
   cat > "${RUNTIME_DIR}/fastcgi_params" <<'EOF'
 fastcgi_param  QUERY_STRING       $query_string;
 fastcgi_param  REQUEST_METHOD     $request_method;
@@ -97,14 +87,9 @@ fastcgi_param  SERVER_NAME        $server_name;
 EOF
 fi
 
-# --- Generate rootless PHP-FPM config in runtime ---
-# This avoids:
-# - /var/log write attempts (read-only)
-# - unix socket chown problems
-# We use TCP 127.0.0.1:9000 instead.
+# --- Rootless PHP-FPM runtime config (TCP 9000, no /var/log, no chown socket) ---
 PHP_FPM_BIN="/usr/sbin/php-fpm8.2"
 if ! command -v "${PHP_FPM_BIN}" >/dev/null 2>&1; then
-  # fallback: some images have php-fpm in PATH
   PHP_FPM_BIN="$(command -v php-fpm8.2 || command -v php-fpm || true)"
 fi
 if [[ -z "${PHP_FPM_BIN}" ]]; then
@@ -121,13 +106,11 @@ pid = ${RUNTIME_DIR}/php-fpm.pid
 error_log = ${LOG_DIR}/php-fpm_error.log
 log_level = notice
 daemonize = no
-
 include=${PHP_FPM_POOL}
 EOF
 
 cat > "${PHP_FPM_POOL}" <<EOF
 [www]
-; Running rootless: do NOT set user/group/chown
 listen = 127.0.0.1:9000
 listen.allowed_clients = 127.0.0.1
 
@@ -137,15 +120,11 @@ pm.start_servers = 4
 pm.min_spare_servers = 2
 pm.max_spare_servers = 8
 
-; Session path must be writable
 php_admin_value[session.save_path] = ${RUNTIME_DIR}/sessions
-
-; Useful defaults
 php_admin_value[error_log] = ${LOG_DIR}/php_errors.log
 php_admin_flag[log_errors] = on
 EOF
 
-# --- Signal handling so Stop/Restart works ---
 NGINX_PID=""
 PHP_PID=""
 
@@ -162,20 +141,22 @@ term_handler() {
     kill -TERM "${PHP_PID}" 2>/dev/null || true
   fi
 
-  # Give them a moment
   sleep 2
   exit 0
 }
 
 trap term_handler SIGTERM SIGINT
 
-# --- Start php-fpm (background) ---
 echo "[TTG] Starting PHP-FPM (${PHP_FPM_BIN})..."
 "${PHP_FPM_BIN}" -y "${PHP_FPM_CONF}" &
 PHP_PID="$!"
 
-# --- Start nginx in foreground (THIS keeps container alive) ---
 echo "[TTG] Starting nginx on port ${PORT}..."
-# nginx will read include fastcgi_params; we force it to find ours first via prefix:
-# simplest: set nginx "prefix" to runtime dir so "include fastcgi_params" resolves
-exec nginx -p "${RUNTIME_DIR}" -c "${NGINX_CONF}" -g "daemon off;"
+
+# IMPORTANT:
+# Force PID file into runtime dir so nginx NEVER touches /run (read-only in Ptero)
+# Also run "daemon off" so the container stays alive.
+exec nginx \
+  -p "${RUNTIME_DIR}" \
+  -c "${NGINX_CONF}" \
+  -g "pid ${RUNTIME_DIR}/nginx.pid; daemon off;"
