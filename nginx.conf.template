@@ -1,48 +1,47 @@
-worker_processes auto;
-pid ${RUNTIME}/nginx.pid;
+worker_processes  1;
+
+error_log  /home/container/.logs/nginx_error.log warn;
+pid        /home/container/.runtime/nginx.pid;
 
 events {
-  worker_connections 1024;
+  worker_connections  1024;
 }
 
 http {
-  include /etc/nginx/mime.types;
-  default_type application/octet-stream;
+  include       /etc/nginx/mime.types;
+  default_type  application/octet-stream;
 
-  access_log ${LOGS}/nginx_access.log;
-  error_log  ${LOGS}/nginx_error.log warn;
+  access_log  /home/container/.logs/nginx_access.log;
 
-  sendfile on;
-  keepalive_timeout 65;
+  sendfile        on;
+  keepalive_timeout  65;
 
-  client_body_temp_path ${RUNTIME}/nginx/client_body;
-  proxy_temp_path       ${RUNTIME}/nginx/proxy;
-  fastcgi_temp_path     ${RUNTIME}/nginx/fastcgi;
-  uwsgi_temp_path       ${RUNTIME}/nginx/uwsgi;
-  scgi_temp_path        ${RUNTIME}/nginx/scgi;
+  # Rootless writable paths
+  client_body_temp_path /home/container/.runtime/nginx/client_body;
+  proxy_temp_path       /home/container/.runtime/nginx/proxy;
+  fastcgi_temp_path     /home/container/.runtime/nginx/fastcgi;
+  uwsgi_temp_path       /home/container/.runtime/nginx/uwsgi;
+  scgi_temp_path        /home/container/.runtime/nginx/scgi;
 
   server {
-    listen ${PORT};
+    listen {{PORT}} default_server;
     server_name _;
 
-    root ${APP_DIR}/public;
+    root /home/container/app/public;
     index index.php index.html;
+
+    client_max_body_size 64m;
 
     location / {
       try_files $uri $uri/ /index.php?$query_string;
     }
 
     location ~ \.php$ {
-      include /etc/nginx/fastcgi_params;
+      include fastcgi_params;
       fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
       fastcgi_param PATH_INFO $fastcgi_path_info;
-      fastcgi_pass unix:${RUNTIME}/php-fpm.sock;
-    }
-
-    location ~* \.(jpg|jpeg|png|gif|css|js|ico|svg|woff2?)$ {
-      expires 7d;
-      add_header Cache-Control "public";
-      try_files $uri =404;
+      fastcgi_pass unix:/home/container/.runtime/php-fpm.sock;
+      fastcgi_read_timeout 300;
     }
   }
 }

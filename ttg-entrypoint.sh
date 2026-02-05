@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUNTIME="${RUNTIME:-/home/container/.runtime}"
-LOGS="${LOGS:-/home/container/.logs}"
-APP_DIR="${APP_DIR:-/home/container/app}"
 PORT="${PORT:-8800}"
 
-NGINX_BIN="${NGINX_BIN:-/usr/sbin/nginx}"
-PHP_FPM_BIN="${PHP_FPM_BIN:-/usr/sbin/php-fpm8.2}"
+APP_DIR="/home/container/app"
+RUNTIME="/home/container/.runtime"
+LOGS="/home/container/.logs"
+
+TEMPLATE_BAKED="/opt/ttg/templates/nginx.conf.template"
+TEMPLATE_VOL1="/home/container/nginx.conf.template"
+TEMPLATE_VOL2="/home/container/app/nginx.conf.template"
 
 echo "[TTG] Invoice Ninja starting..."
 echo "[TTG] PORT: ${PORT}"
@@ -15,90 +17,93 @@ echo "[TTG] RUNTIME: ${RUNTIME}"
 echo "[TTG] LOGS: ${LOGS}"
 echo "[TTG] APP_DIR: ${APP_DIR}"
 
-# Must be writable volume paths in Pterodactyl
-mkdir -p "${RUNTIME}/nginx" "${RUNTIME}/tmp" "${RUNTIME}/sessions" "${LOGS}"
+# Runtime dirs (no chown in rootless)
+mkdir -p "${RUNTIME}" "${LOGS}"
+mkdir -p "${RUNTIME}/nginx" \
+         "${RUNTIME}/nginx/client_body" \
+         "${RUNTIME}/nginx/proxy" \
+         "${RUNTIME}/nginx/fastcgi" \
+         "${RUNTIME}/nginx/uwsgi" \
+         "${RUNTIME}/nginx/scgi"
 
-# Chromium (optional)
+# Chromium
 if command -v chromium >/dev/null 2>&1; then
   echo "[TTG] Chromium detected: $(command -v chromium)"
-  export CHROME_BIN="$(command -v chromium)"
-elif command -v chromium-browser >/dev/null 2>&1; then
-  echo "[TTG] Chromium detected: $(command -v chromium-browser)"
-  export CHROME_BIN="$(command -v chromium-browser)"
 fi
 
-# Render nginx.conf into runtime (NEVER touch /etc at runtime)
-if [[ -f "/home/container/nginx.conf.template" ]]; then
-  export PORT RUNTIME LOGS APP_DIR
-  envsubst '${PORT} ${RUNTIME} ${LOGS} ${APP_DIR}' \
-    < "/home/container/nginx.conf.template" \
-    > "${RUNTIME}/nginx.conf"
-elif [[ -f "${APP_DIR}/nginx.conf.template" ]]; then
-  export PORT RUNTIME LOGS APP_DIR
-  envsubst '${PORT} ${RUNTIME} ${LOGS} ${APP_DIR}' \
-    < "${APP_DIR}/nginx.conf.template" \
-    > "${RUNTIME}/nginx.conf"
-else
-  echo "[TTG] ERROR: nginx.conf.template not found (expected /home/container/nginx.conf.template or ${APP_DIR}/nginx.conf.template)"
+# Choose nginx template
+NGINX_TEMPLATE=""
+if [[ -f "${TEMPLATE_VOL1}" ]]; then
+  NGINX_TEMPLATE="${TEMPLATE_VOL1}"
+elif [[ -f "${TEMPLATE_VOL2}" ]]; then
+  NGINX_TEMPLATE="${TEMPLATE_VOL2}"
+elif [[ -f "${TEMPLATE_BAKED}" ]]; then
+  NGINX_TEMPLATE="${TEMPLATE_BAKED}"
+fi
+
+if [[ -z "${NGINX_TEMPLATE}" ]]; then
+  echo "[TTG] ERROR: nginx.conf.template not found (expected ${TEMPLATE_VOL1} or ${TEMPLATE_VOL2} or ${TEMPLATE_BAKED})"
   exit 1
 fi
 
-# Render php-fpm.conf into runtime (NEVER touch /etc at runtime)
-if [[ -f "/home/container/docker/php-fpm.conf" ]]; then
-  export RUNTIME LOGS
-  envsubst '${RUNTIME} ${LOGS}' \
-    < "/home/container/docker/php-fpm.conf" \
-    > "${RUNTIME}/php-fpm.conf"
-else
-  echo "[TTG] ERROR: /home/container/docker/php-fpm.conf not found"
+echo "[TTG] Using nginx.conf.template from: ${NGINX_TEMPLATE}"
+
+# Render nginx conf into writable runtime
+sed "s/{{PORT}}/${PORT}/g" "${NGINX_TEMPLATE}" > "${RUNTIME}/nginx.conf"
+
+# PHP-FPM socket config (Debian php-fpm8.2)
+# We force it to use a unix socket in writable runtime.
+PHP_FPM_BIN="/usr/sbin/php-fpm8.2"
+if [[ ! -x "${PHP_FPM_BIN}" ]]; then
+  echo "[TTG] ERROR: php-fpm8.2 not found at ${PHP_FPM_BIN}"
   exit 1
 fi
 
-# Render pool config into runtime
-if [[ -f "/home/container/docker/www.conf" ]]; then
-  export RUNTIME LOGS
-  envsubst '${RUNTIME} ${LOGS}' \
-    < "/home/container/docker/www.conf" \
-    > "${RUNTIME}/www.conf"
-else
-  echo "[TTG] ERROR: /home/container/docker/www.conf not found"
-  exit 1
-fi
+# Create a minimal pool override (include into default)
+cat > "${RUNTIME}/zz-ttg-fpm.conf" <<'EOF'
+[global]
+error_log = /home/container/.logs/php-fpm_error.log
 
-# Make sure FPM includes our pool
-# (php-fpm.conf will include ${RUNTIME}/www.conf)
-# Also ensure app exists
-if [[ ! -d "${APP_DIR}" ]]; then
-  echo "[TTG] ERROR: APP_DIR does not exist: ${APP_DIR}"
-  exit 1
-fi
+[www]
+listen = /home/container/.runtime/php-fpm.sock
+listen.owner = container
+listen.group = container
+listen.mode = 0660
 
-# Clean stale pid/socket files if any
-rm -f "${RUNTIME}/nginx.pid" "${RUNTIME}/php-fpm.pid" "${RUNTIME}/php-fpm.sock" 2>/dev/null || true
+pm = dynamic
+pm.max_children = 25
+pm.start_servers = 4
+pm.min_spare_servers = 2
+pm.max_spare_servers = 8
 
-# Graceful shutdown for Pterodactyl stop/restart
-terminate() {
-  echo "[TTG] Caught stop signal, shutting down..."
+catch_workers_output = yes
+EOF
 
-  # Stop nginx
-  if [[ -f "${RUNTIME}/nginx.pid" ]]; then
-    "${NGINX_BIN}" -c "${RUNTIME}/nginx.conf" -s quit 2>/dev/null || true
-  fi
-
-  # Stop php-fpm
-  if [[ -f "${RUNTIME}/php-fpm.pid" ]]; then
-    kill -TERM "$(cat "${RUNTIME}/php-fpm.pid")" 2>/dev/null || true
-  fi
-
-  # Give them a second then exit
-  sleep 1
-  exit 0
-}
-trap terminate SIGTERM SIGINT
-
+# Start php-fpm in foreground (daemonize = no)
 echo "[TTG] Starting PHP-FPM (${PHP_FPM_BIN})..."
-"${PHP_FPM_BIN}" -y "${RUNTIME}/php-fpm.conf" --fpm-config "${RUNTIME}/php-fpm.conf" -D
+"${PHP_FPM_BIN}" -F -y /etc/php/8.2/fpm/php-fpm.conf -d "include=${RUNTIME}/zz-ttg-fpm.conf" &
+PHP_PID=$!
 
+# Start nginx in foreground with custom conf + runtime prefix
 echo "[TTG] Starting nginx on port ${PORT}..."
-# Run nginx in foreground so container stays alive and stop works
-exec "${NGINX_BIN}" -c "${RUNTIME}/nginx.conf" -g "daemon off;"
+nginx -c "${RUNTIME}/nginx.conf" -p "${RUNTIME}/nginx" -g "daemon off;" &
+NGINX_PID=$!
+
+# Graceful stop
+term_handler() {
+  echo "[TTG] Caught stop signal, shutting down..."
+  if kill -0 "${NGINX_PID}" 2>/dev/null; then
+    nginx -c "${RUNTIME}/nginx.conf" -p "${RUNTIME}/nginx" -s quit || true
+  fi
+  if kill -0 "${PHP_PID}" 2>/dev/null; then
+    kill "${PHP_PID}" || true
+  fi
+  wait || true
+  echo "[TTG] Stopped."
+}
+
+trap term_handler SIGTERM SIGINT
+
+# Wait on either process
+wait -n "${PHP_PID}" "${NGINX_PID}"
+term_handler
