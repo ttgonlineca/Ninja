@@ -3,7 +3,6 @@ FROM debian:12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ENV APP_DIR=/home/container/app
 
-# ---- Packages ----
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     ca-certificates curl git unzip \
@@ -17,14 +16,11 @@ RUN apt-get update \
     libxshmfence1 libxss1 xdg-utils \
  && rm -rf /var/lib/apt/lists/*
 
-# ---- Chromium aliases ----
 RUN ln -sf /usr/bin/chromium /usr/bin/google-chrome \
  && ln -sf /usr/bin/chromium /usr/bin/chromium-browser
 
-# ---- Pterodactyl user ----
 RUN useradd -m -d /home/container -u 999 container
 
-# ---- Composer ----
 RUN curl -sS https://getcomposer.org/installer | php -- \
     --install-dir=/usr/local/bin --filename=composer
 
@@ -37,11 +33,17 @@ COPY . ${APP_DIR}
 RUN mkdir -p /home/container/.runtime /home/container/.logs \
  && chown -R container:container /home/container
 
-# ---- Nginx template (THIS IS THE KEY FIX) ----
-COPY nginx.conf.template /home/container/nginx.conf.template
-RUN chown container:container /home/container/nginx.conf.template
+# ---- Put template somewhere that survives Pterodactyl volume mounts ----
+# 1) Inside app (persisted)
+# 2) Also in /opt/ttg/templates (not mounted, good fallback)
+RUN mkdir -p /opt/ttg/templates
+COPY nginx.conf.template ${APP_DIR}/nginx.conf.template
+COPY nginx.conf.template /opt/ttg/templates/nginx.conf.template
 
-# ---- Entrypoint ----
+RUN chown container:container ${APP_DIR}/nginx.conf.template \
+ && chmod 644 ${APP_DIR}/nginx.conf.template \
+ && chmod 644 /opt/ttg/templates/nginx.conf.template
+
 COPY ttg-entrypoint.sh /usr/local/bin/ttg-entrypoint.sh
 RUN chmod +x /usr/local/bin/ttg-entrypoint.sh
 
