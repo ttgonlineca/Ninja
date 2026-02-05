@@ -3,44 +3,90 @@ FROM debian:12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ENV APP_DIR=/home/container/app
 
-# ---- Packages ----
+# --------------------------------------------------
+# System packages
+# --------------------------------------------------
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-    ca-certificates curl git unzip \
+    ca-certificates \
+    curl \
+    git \
+    unzip \
     nginx \
-    php8.2 php8.2-cli php8.2-fpm \
-    php8.2-mysql php8.2-gd php8.2-curl php8.2-zip php8.2-mbstring php8.2-xml php8.2-bcmath php8.2-intl php8.2-imagick \
+    php8.2 \
+    php8.2-cli \
+    php8.2-fpm \
+    php8.2-mysql \
+    php8.2-gd \
+    php8.2-curl \
+    php8.2-zip \
+    php8.2-mbstring \
+    php8.2-xml \
+    php8.2-bcmath \
+    php8.2-intl \
+    php8.2-imagick \
     mariadb-client \
-    # PDF / headless deps
     chromium \
     fonts-liberation \
-    libnss3 libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
-    libasound2 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgtk-3-0 \
-    libxshmfence1 libxss1 xdg-utils \
+    libnss3 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libgtk-3-0 \
+    libxshmfence1 \
+    libxss1 \
+    xdg-utils \
  && rm -rf /var/lib/apt/lists/*
 
-# ---- Chromium compatibility aliases (many apps expect these) ----
+# --------------------------------------------------
+# Chromium compatibility aliases
+# --------------------------------------------------
 RUN ln -sf /usr/bin/chromium /usr/bin/google-chrome \
  && ln -sf /usr/bin/chromium /usr/bin/chromium-browser
 
-# ---- Pterodactyl user ----
+# --------------------------------------------------
+# Pterodactyl container user (UID 999)
+# --------------------------------------------------
 RUN useradd -m -d /home/container -u 999 container
 
-# ---- Composer ----
-RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+# --------------------------------------------------
+# Composer
+# --------------------------------------------------
+RUN curl -sS https://getcomposer.org/installer \
+ | php -- --install-dir=/usr/local/bin --filename=composer
 
-# ---- App ----
+# --------------------------------------------------
+# Application files
+# --------------------------------------------------
 RUN mkdir -p ${APP_DIR}
 WORKDIR ${APP_DIR}
 COPY . ${APP_DIR}
-RUN chown -R container:container /home/container
 
-# ---- Nginx config ----
-COPY nginx.conf.template /etc/nginx/nginx.conf.template
+# --------------------------------------------------
+# Runtime configs (IMPORTANT)
+# These MUST live under /home/container
+# --------------------------------------------------
+COPY nginx.conf.template /home/container/nginx.conf.template
+COPY docker/php-fpm.conf /home/container/docker/php-fpm.conf
+COPY docker/www.conf /home/container/docker/www.conf
 
-# ---- Entrypoint ----
+# --------------------------------------------------
+# Entrypoint
+# --------------------------------------------------
 COPY ttg-entrypoint.sh /usr/local/bin/ttg-entrypoint.sh
 RUN chmod +x /usr/local/bin/ttg-entrypoint.sh
+
+# --------------------------------------------------
+# Permissions
+# --------------------------------------------------
+RUN chown -R container:container /home/container
 
 USER container
 EXPOSE 8800
