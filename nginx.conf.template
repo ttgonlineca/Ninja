@@ -38,10 +38,21 @@ http {
 
     location ~ \.php$ {
       include fastcgi_params;
+
       fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
       fastcgi_param PATH_INFO $fastcgi_path_info;
-      fastcgi_pass unix:/home/container/.runtime/php-fpm.sock;
+      fastcgi_param HTTPS off;
+
+      # IMPORTANT: TCP PHP-FPM (no unix socket, no chown issues)
+      fastcgi_pass 127.0.0.1:9000;
+
       fastcgi_read_timeout 300;
+      fastcgi_buffer_size 32k;
+      fastcgi_buffers 8 16k;
+    }
+
+    location ~ /\. {
+      deny all;
     }
   }
 }
