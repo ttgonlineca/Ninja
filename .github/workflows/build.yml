@@ -43,3 +43,5 @@ jobs:
           tags: |
             ghcr.io/ttgonlineca/invoiceninja-ptero:latest
             ghcr.io/ttgonlineca/invoiceninja-ptero:${{ github.run_id }}
+
+# rebuild trigger

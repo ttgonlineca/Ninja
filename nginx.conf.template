@@ -1,34 +1,57 @@
 worker_processes  1;
 
-events { worker_connections  1024; }
+error_log  /home/container/.logs/nginx_error.log warn;
+
+events {
+  worker_connections  1024;
+}
 
 http {
-    include       /etc/nginx/mime.types;
-    default_type  application/octet-stream;
+  include       /etc/nginx/mime.types;
+  default_type  application/octet-stream;
 
-    sendfile        on;
-    keepalive_timeout  65;
+  access_log  /home/container/.logs/nginx_access.log;
 
-    server {
-        listen {{PORT}};
-        server_name _;
+  sendfile        on;
+  keepalive_timeout  65;
 
-        root /home/container/app/public;
-        index index.php index.html;
+  # Rootless writable paths
+  client_body_temp_path /home/container/.runtime/nginx/client_body;
+  proxy_temp_path       /home/container/.runtime/nginx/proxy;
+  fastcgi_temp_path     /home/container/.runtime/nginx/fastcgi;
+  uwsgi_temp_path       /home/container/.runtime/nginx/uwsgi;
+  scgi_temp_path        /home/container/.runtime/nginx/scgi;
 
-        location / {
-            try_files $uri $uri/ /index.php?$query_string;
-        }
+  server {
+    listen {{PORT}} default_server;
+    server_name _;
 
-        location ~ \.php$ {
-            include /etc/nginx/fastcgi_params;
-            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-            fastcgi_index index.php;
-            fastcgi_pass 127.0.0.1:9000;
-        }
+    root /home/container/app/public;
+    index index.php index.html;
 
-        location ~ /\.ht {
-            deny all;
-        }
+    client_max_body_size 64m;
+
+    location / {
+      try_files $uri $uri/ /index.php?$query_string;
     }
+
+    location ~ \.php$ {
+      include fastcgi_params;
+
+      fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+      fastcgi_param PATH_INFO $fastcgi_path_info;
+      fastcgi_param HTTPS off;
+
+      # TCP PHP-FPM (rootless safe)
+      fastcgi_pass 127.0.0.1:9000;
+
+      fastcgi_read_timeout 300;
+      fastcgi_buffer_size 32k;
+      fastcgi_buffers 8 16k;
+    }
+
+    location ~ /\. {
+      deny all;
+    }
+  }
 }

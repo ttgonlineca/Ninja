@@ -1,126 +1,256 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "[TTG] Invoice Ninja (FPM) starting..."
+export PORT="${PORT:-8800}"
+export APP_DIR="${APP_DIR:-/home/container/app}"
+export RUNTIME_DIR="${RUNTIME_DIR:-/home/container/.runtime}"
+export LOG_DIR="${LOG_DIR:-/home/container/.logs}"
 
-PORT="${PORT:-8800}"
-
-BASE="/home/container"
-RUNTIME="${BASE}/.runtime"
-LOGS="${BASE}/.logs"
-APP_DIR="${BASE}/app"
-
-mkdir -p "$RUNTIME" "$LOGS" "$RUNTIME/tmp" "$RUNTIME/sessions" /tmp
-
+echo "[TTG] Invoice Ninja starting..."
 echo "[TTG] PORT: ${PORT}"
-echo "[TTG] RUNTIME: ${RUNTIME}"
-echo "[TTG] LOGS: ${LOGS}"
+echo "[TTG] RUNTIME: ${RUNTIME_DIR}"
+echo "[TTG] LOGS: ${LOG_DIR}"
 echo "[TTG] APP_DIR: ${APP_DIR}"
 
-# Laravel writable directories
-if [ -d "$APP_DIR" ]; then
-  mkdir -p "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" \
-           "$APP_DIR/storage/logs" "$APP_DIR/storage/framework/cache" \
-           "$APP_DIR/storage/framework/sessions" "$APP_DIR/storage/framework/views" || true
-  chmod -R u+rwX,go+rX "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" 2>/dev/null || true
+mkdir -p \
+  "${RUNTIME_DIR}" \
+  "${RUNTIME_DIR}/nginx/client_body" \
+  "${RUNTIME_DIR}/nginx/proxy" \
+  "${RUNTIME_DIR}/nginx/fastcgi" \
+  "${RUNTIME_DIR}/nginx/uwsgi" \
+  "${RUNTIME_DIR}/nginx/scgi" \
+  "${RUNTIME_DIR}/sessions" \
+  "${RUNTIME_DIR}/tmp" \
+  "${LOG_DIR}"
+
+# ==========================================================
+# TTG FIX: .env MUST reflect Pterodactyl startup variables
+# - Do NOT overwrite .env blindly.
+# - Update/append only keys we care about (idempotent).
+# - This prevents "drift" and keeps 2FA/encryption stable.
+# ==========================================================
+ENV_FILE="${APP_DIR}/.env"
+
+set_env() {
+  local key="$1"
+  local val="${2:-}"
+
+  # If value is empty, do nothing (don't wipe existing .env key)
+  [[ -z "${val}" ]] && return 0
+
+  if grep -qE "^${key}=" "${ENV_FILE}"; then
+    # Replace existing line
+    sed -i "s|^${key}=.*|${key}=${val}|" "${ENV_FILE}"
+  else
+    # Append new line
+    printf '%s=%s\n' "${key}" "${val}" >> "${ENV_FILE}"
+  fi
+}
+
+# Ensure app dir exists
+if [[ ! -d "${APP_DIR}" ]]; then
+  echo "[TTG] ERROR: APP_DIR not found: ${APP_DIR}"
+  exit 1
 fi
 
-# Nginx config (absolute include paths + writable pid)
-NGINX_CONF="${RUNTIME}/nginx.conf"
+# Create .env only if missing (never regenerate it every boot)
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "[TTG] .env not found, creating minimal .env"
+  touch "${ENV_FILE}"
+fi
 
-cat > "$NGINX_CONF" <<EOF
-pid ${RUNTIME}/nginx.pid;
+# --- Laravel / App ---
+# (APP_KEY must match your migrated DB-encrypted values; do not auto-generate)
+set_env APP_NAME        "${APP_NAME:-Invoice Ninja}"
+set_env APP_ENV         "${APP_ENV:-production}"
+set_env APP_DEBUG       "${APP_DEBUG:-false}"
+set_env APP_KEY         "${APP_KEY:-}"
+set_env APP_URL         "${APP_URL:-}"
+set_env REQUIRE_HTTPS   "${REQUIRE_HTTPS:-false}"
+set_env NINJA_ENVIRONMENT "${NINJA_ENVIRONMENT:-selfhost}"
 
-worker_processes  1;
+# --- Database mapping ---
+# Support either TTG_* variables or standard DB_* variables.
+# Use Ptero startup vars as source-of-truth; do NOT revert to defaults.
+DB_CONNECTION_VAL="${DB_CONNECTION:-${DB_TYPE:-mysql}}"
+DB_HOST_VAL="${DB_HOST:-${TTG_DB_HOST:-}}"
+DB_PORT_VAL="${DB_PORT:-${TTG_DB_PORT:-}}"
+DB_DATABASE_VAL="${DB_DATABASE:-${TTG_DB_DATABASE:-}}"
+DB_USERNAME_VAL="${DB_USERNAME:-${TTG_DB_USERNAME:-}}"
+DB_PASSWORD_VAL="${DB_PASSWORD:-${TTG_DB_PASSWORD:-}}"
 
-events { worker_connections 1024; }
+set_env DB_CONNECTION   "${DB_CONNECTION_VAL}"
+set_env MULTI_DB_ENABLED "${MULTI_DB_ENABLED:-false}"
 
-http {
-  include       /etc/nginx/mime.types;
-  default_type  application/octet-stream;
+set_env DB_HOST         "${DB_HOST_VAL}"
+set_env DB_PORT         "${DB_PORT_VAL}"
+set_env DB_DATABASE     "${DB_DATABASE_VAL}"
+set_env DB_USERNAME     "${DB_USERNAME_VAL}"
+set_env DB_PASSWORD     "${DB_PASSWORD_VAL}"
 
-  access_log    ${LOGS}/nginx-access.log;
-  error_log     ${LOGS}/nginx-error.log warn;
+# --- Redis mapping ---
+REDIS_HOST_VAL="${REDIS_HOST:-${TTG_REDIS_HOST:-}}"
+REDIS_PORT_VAL="${REDIS_PORT:-${TTG_REDIS_PORT:-}}"
+REDIS_PASSWORD_VAL="${REDIS_PASSWORD:-${TTG_REDIS_PASSWORD:-}}"
 
-  sendfile      on;
-  keepalive_timeout  65;
+set_env REDIS_HOST      "${REDIS_HOST_VAL}"
+set_env REDIS_PORT      "${REDIS_PORT_VAL}"
+set_env REDIS_PASSWORD  "${REDIS_PASSWORD_VAL}"
 
-  client_body_temp_path /tmp/nginx_client_body;
-  proxy_temp_path       /tmp/nginx_proxy;
-  fastcgi_temp_path     /tmp/nginx_fastcgi;
-  uwsgi_temp_path       /tmp/nginx_uwsgi;
-  scgi_temp_path        /tmp/nginx_scgi;
+# --- Cache / Session / Queue ---
+set_env CACHE_DRIVER      "${CACHE_DRIVER:-file}"
+set_env SESSION_DRIVER    "${SESSION_DRIVER:-file}"
+set_env QUEUE_CONNECTION  "${QUEUE_CONNECTION:-sync}"
 
-  server {
-    listen ${PORT};
-    server_name _;
+# --- Mail ---
+set_env MAIL_MAILER "${MAIL_MAILER:-smtp}"
 
-    root ${APP_DIR}/public;
-    index index.php index.html;
+# --- PDF generator ---
+# Keep your hosted_ninja choice unless you intentionally switch.
+set_env PDF_GENERATOR "${PDF_GENERATOR:-hosted_ninja}"
 
-    location / {
-      try_files \$uri \$uri/ /index.php?\$query_string;
-    }
+echo "[TTG] .env sync complete (startup vars -> ${ENV_FILE})"
 
-    location ~ \.php\$ {
-      include /etc/nginx/fastcgi_params;
-      fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-      fastcgi_pass 127.0.0.1:9000;
-      fastcgi_read_timeout 300;
-    }
+# --- Chromium check (for PDF) ---
+if command -v chromium >/dev/null 2>&1; then
+  echo "[TTG] Chromium detected: $(command -v chromium)"
+  export TTG_CHROMIUM_PATH="$(command -v chromium)"
+elif command -v chromium-browser >/dev/null 2>&1; then
+  echo "[TTG] Chromium detected: $(command -v chromium-browser)"
+  export TTG_CHROMIUM_PATH="$(command -v chromium-browser)"
+elif command -v google-chrome >/dev/null 2>&1; then
+  echo "[TTG] Chromium detected: $(command -v google-chrome)"
+  export TTG_CHROMIUM_PATH="$(command -v google-chrome)"
+else
+  echo "[TTG] WARN: Chromium not found in PATH"
+fi
 
-    location ~ /\. {
-      deny all;
-    }
-  }
-}
+# --- Find nginx template ---
+TEMPLATE=""
+if [[ -f "/home/container/nginx.conf.template" ]]; then
+  TEMPLATE="/home/container/nginx.conf.template"
+elif [[ -f "${APP_DIR}/nginx.conf.template" ]]; then
+  TEMPLATE="${APP_DIR}/nginx.conf.template"
+elif [[ -f "/opt/ttg/templates/nginx.conf.template" ]]; then
+  TEMPLATE="/opt/ttg/templates/nginx.conf.template"
+fi
+
+if [[ -z "${TEMPLATE}" ]]; then
+  echo "[TTG] ERROR: nginx.conf.template not found (expected /home/container/nginx.conf.template or ${APP_DIR}/nginx.conf.template or /opt/ttg/templates/nginx.conf.template)"
+  exit 1
+fi
+
+echo "[TTG] Using nginx.conf.template from: ${TEMPLATE}"
+
+# --- Render nginx.conf (replace {{PORT}}) ---
+NGINX_CONF="${RUNTIME_DIR}/nginx.conf"
+sed "s/{{PORT}}/${PORT}/g" "${TEMPLATE}" > "${NGINX_CONF}"
+
+# --- Ensure fastcgi_params exists (rootless-safe include path) ---
+if [[ -f "/etc/nginx/fastcgi_params" ]]; then
+  cp -f "/etc/nginx/fastcgi_params" "${RUNTIME_DIR}/fastcgi_params"
+else
+  cat > "${RUNTIME_DIR}/fastcgi_params" <<'EOF'
+fastcgi_param  QUERY_STRING       $query_string;
+fastcgi_param  REQUEST_METHOD     $request_method;
+fastcgi_param  CONTENT_TYPE       $content_type;
+fastcgi_param  CONTENT_LENGTH     $content_length;
+
+fastcgi_param  SCRIPT_NAME        $fastcgi_script_name;
+fastcgi_param  REQUEST_URI        $request_uri;
+fastcgi_param  DOCUMENT_URI       $document_uri;
+fastcgi_param  DOCUMENT_ROOT      $document_root;
+fastcgi_param  SERVER_PROTOCOL    $server_protocol;
+fastcgi_param  REQUEST_SCHEME     $scheme;
+fastcgi_param  HTTPS              $https if_not_empty;
+
+fastcgi_param  GATEWAY_INTERFACE  CGI/1.1;
+fastcgi_param  SERVER_SOFTWARE    nginx/$nginx_version;
+
+fastcgi_param  REMOTE_ADDR        $remote_addr;
+fastcgi_param  REMOTE_PORT        $remote_port;
+fastcgi_param  SERVER_ADDR        $server_addr;
+fastcgi_param  SERVER_PORT        $server_port;
+fastcgi_param  SERVER_NAME        $server_name;
 EOF
+fi
 
-mkdir -p /tmp/nginx_client_body /tmp/nginx_proxy /tmp/nginx_fastcgi /tmp/nginx_uwsgi /tmp/nginx_scgi 2>/dev/null || true
+# --- Rootless PHP-FPM runtime config (TCP 9000, no /var/log, no chown socket) ---
+PHP_FPM_BIN="/usr/sbin/php-fpm8.2"
+if ! command -v "${PHP_FPM_BIN}" >/dev/null 2>&1; then
+  PHP_FPM_BIN="$(command -v php-fpm8.2 || command -v php-fpm || true)"
+fi
+if [[ -z "${PHP_FPM_BIN}" ]]; then
+  echo "[TTG] ERROR: php-fpm binary not found"
+  exit 1
+fi
 
-echo "[TTG] Wrote nginx config: ${NGINX_CONF}"
+PHP_FPM_CONF="${RUNTIME_DIR}/php-fpm.conf"
+PHP_FPM_POOL="${RUNTIME_DIR}/php-fpm.pool.conf"
 
-# PHP-FPM config (all writable paths)
-FPM_CONF="${RUNTIME}/php-fpm.conf"
-FPM_POOL="${RUNTIME}/www.conf"
-FPM_PID="${RUNTIME}/php-fpm.pid"
-
-cat > "$FPM_CONF" <<EOF
+cat > "${PHP_FPM_CONF}" <<EOF
 [global]
-pid = ${FPM_PID}
-error_log = ${LOGS}/php-fpm.log
+pid = ${RUNTIME_DIR}/php-fpm.pid
+error_log = ${LOG_DIR}/php-fpm_error.log
 log_level = notice
-daemonize = yes
-
-include=${FPM_POOL}
+daemonize = no
+include=${PHP_FPM_POOL}
 EOF
 
-cat > "$FPM_POOL" <<EOF
+cat > "${PHP_FPM_POOL}" <<EOF
 [www]
 listen = 127.0.0.1:9000
 listen.allowed_clients = 127.0.0.1
 
 pm = dynamic
-pm.max_children = 10
-pm.start_servers = 2
-pm.min_spare_servers = 1
-pm.max_spare_servers = 3
+pm.max_children = 20
+pm.start_servers = 4
+pm.min_spare_servers = 2
+pm.max_spare_servers = 8
 
-catch_workers_output = yes
-clear_env = no
-
-php_admin_value[session.save_path] = ${RUNTIME}/sessions
-php_admin_value[sys_temp_dir] = ${RUNTIME}/tmp
-php_admin_value[upload_tmp_dir] = ${RUNTIME}/tmp
+php_admin_value[session.save_path] = ${RUNTIME_DIR}/sessions
+php_admin_value[error_log] = ${LOG_DIR}/php_errors.log
+php_admin_flag[log_errors] = on
 EOF
 
-echo "[TTG] Prepared PHP-FPM config: ${FPM_CONF}"
+NGINX_PID=""
+PHP_PID=""
 
-FPM_BIN="/usr/sbin/php-fpm8.2"
-[ -x "$FPM_BIN" ] || FPM_BIN="/usr/sbin/php-fpm"
+term_handler() {
+  echo "[TTG] Caught stop signal, shutting down..."
 
-echo "[TTG] Starting PHP-FPM: ${FPM_BIN}"
-"$FPM_BIN" -y "$FPM_CONF" -D
+  if [[ -n "${NGINX_PID}" ]] && kill -0 "${NGINX_PID}" 2>/dev/null; then
+    echo "[TTG] Stopping nginx..."
+    kill -QUIT "${NGINX_PID}" 2>/dev/null || true
+  fi
 
-echo "[TTG] Starting nginx..."
-exec nginx -c "$NGINX_CONF" -g "daemon off;"
+  if [[ -n "${PHP_PID}" ]] && kill -0 "${PHP_PID}" 2>/dev/null; then
+    echo "[TTG] Stopping php-fpm..."
+    kill -TERM "${PHP_PID}" 2>/dev/null || true
+  fi
+
+  sleep 2
+  exit 0
+}
+
+trap term_handler SIGTERM SIGINT
+
+# Clear Laravel caches AFTER env sync (prevents stale config)
+if [[ -f "${APP_DIR}/artisan" ]]; then
+  echo "[TTG] Clearing Laravel caches..."
+  (cd "${APP_DIR}" && php artisan optimize:clear) >/dev/null 2>&1 || true
+fi
+
+echo "[TTG] Starting PHP-FPM (${PHP_FPM_BIN})..."
+"${PHP_FPM_BIN}" -y "${PHP_FPM_CONF}" &
+PHP_PID="$!"
+
+echo "[TTG] Starting nginx on port ${PORT}..."
+
+# IMPORTANT:
+# Force PID file into runtime dir so nginx NEVER touches /run (read-only in Ptero)
+# Also run "daemon off" so the container stays alive.
+exec nginx \
+  -p "${RUNTIME_DIR}" \
+  -c "${NGINX_CONF}" \
+  -g "pid ${RUNTIME_DIR}/nginx.pid; daemon off;"
