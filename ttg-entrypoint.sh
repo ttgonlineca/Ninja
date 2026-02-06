@@ -23,6 +23,94 @@ mkdir -p \
   "${RUNTIME_DIR}/tmp" \
   "${LOG_DIR}"
 
+# ==========================================================
+# TTG FIX: .env MUST reflect Pterodactyl startup variables
+# - Do NOT overwrite .env blindly.
+# - Update/append only keys we care about (idempotent).
+# - This prevents "drift" and keeps 2FA/encryption stable.
+# ==========================================================
+ENV_FILE="${APP_DIR}/.env"
+
+set_env() {
+  local key="$1"
+  local val="${2:-}"
+
+  # If value is empty, do nothing (don't wipe existing .env key)
+  [[ -z "${val}" ]] && return 0
+
+  if grep -qE "^${key}=" "${ENV_FILE}"; then
+    # Replace existing line
+    sed -i "s|^${key}=.*|${key}=${val}|" "${ENV_FILE}"
+  else
+    # Append new line
+    printf '%s=%s\n' "${key}" "${val}" >> "${ENV_FILE}"
+  fi
+}
+
+# Ensure app dir exists
+if [[ ! -d "${APP_DIR}" ]]; then
+  echo "[TTG] ERROR: APP_DIR not found: ${APP_DIR}"
+  exit 1
+fi
+
+# Create .env only if missing (never regenerate it every boot)
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "[TTG] .env not found, creating minimal .env"
+  touch "${ENV_FILE}"
+fi
+
+# --- Laravel / App ---
+# (APP_KEY must match your migrated DB-encrypted values; do not auto-generate)
+set_env APP_NAME        "${APP_NAME:-Invoice Ninja}"
+set_env APP_ENV         "${APP_ENV:-production}"
+set_env APP_DEBUG       "${APP_DEBUG:-false}"
+set_env APP_KEY         "${APP_KEY:-}"
+set_env APP_URL         "${APP_URL:-}"
+set_env REQUIRE_HTTPS   "${REQUIRE_HTTPS:-false}"
+set_env NINJA_ENVIRONMENT "${NINJA_ENVIRONMENT:-selfhost}"
+
+# --- Database mapping ---
+# Support either TTG_* variables or standard DB_* variables.
+# Use Ptero startup vars as source-of-truth; do NOT revert to defaults.
+DB_CONNECTION_VAL="${DB_CONNECTION:-${DB_TYPE:-mysql}}"
+DB_HOST_VAL="${DB_HOST:-${TTG_DB_HOST:-}}"
+DB_PORT_VAL="${DB_PORT:-${TTG_DB_PORT:-}}"
+DB_DATABASE_VAL="${DB_DATABASE:-${TTG_DB_DATABASE:-}}"
+DB_USERNAME_VAL="${DB_USERNAME:-${TTG_DB_USERNAME:-}}"
+DB_PASSWORD_VAL="${DB_PASSWORD:-${TTG_DB_PASSWORD:-}}"
+
+set_env DB_CONNECTION   "${DB_CONNECTION_VAL}"
+set_env MULTI_DB_ENABLED "${MULTI_DB_ENABLED:-false}"
+
+set_env DB_HOST         "${DB_HOST_VAL}"
+set_env DB_PORT         "${DB_PORT_VAL}"
+set_env DB_DATABASE     "${DB_DATABASE_VAL}"
+set_env DB_USERNAME     "${DB_USERNAME_VAL}"
+set_env DB_PASSWORD     "${DB_PASSWORD_VAL}"
+
+# --- Redis mapping ---
+REDIS_HOST_VAL="${REDIS_HOST:-${TTG_REDIS_HOST:-}}"
+REDIS_PORT_VAL="${REDIS_PORT:-${TTG_REDIS_PORT:-}}"
+REDIS_PASSWORD_VAL="${REDIS_PASSWORD:-${TTG_REDIS_PASSWORD:-}}"
+
+set_env REDIS_HOST      "${REDIS_HOST_VAL}"
+set_env REDIS_PORT      "${REDIS_PORT_VAL}"
+set_env REDIS_PASSWORD  "${REDIS_PASSWORD_VAL}"
+
+# --- Cache / Session / Queue ---
+set_env CACHE_DRIVER      "${CACHE_DRIVER:-file}"
+set_env SESSION_DRIVER    "${SESSION_DRIVER:-file}"
+set_env QUEUE_CONNECTION  "${QUEUE_CONNECTION:-sync}"
+
+# --- Mail ---
+set_env MAIL_MAILER "${MAIL_MAILER:-smtp}"
+
+# --- PDF generator ---
+# Keep your hosted_ninja choice unless you intentionally switch.
+set_env PDF_GENERATOR "${PDF_GENERATOR:-hosted_ninja}"
+
+echo "[TTG] .env sync complete (startup vars -> ${ENV_FILE})"
+
 # --- Chromium check (for PDF) ---
 if command -v chromium >/dev/null 2>&1; then
   echo "[TTG] Chromium detected: $(command -v chromium)"
@@ -146,6 +234,12 @@ term_handler() {
 }
 
 trap term_handler SIGTERM SIGINT
+
+# Clear Laravel caches AFTER env sync (prevents stale config)
+if [[ -f "${APP_DIR}/artisan" ]]; then
+  echo "[TTG] Clearing Laravel caches..."
+  (cd "${APP_DIR}" && php artisan optimize:clear) >/dev/null 2>&1 || true
+fi
 
 echo "[TTG] Starting PHP-FPM (${PHP_FPM_BIN})..."
 "${PHP_FPM_BIN}" -y "${PHP_FPM_CONF}" &
